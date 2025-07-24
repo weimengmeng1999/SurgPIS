@@ -1,0 +1,10 @@
+cityscapesscripts
+opencv-python
+pytorch_pretrained_vit
+cython
+scipy
+shapely
+timm
+h5py
+submitit
+scikit-image
