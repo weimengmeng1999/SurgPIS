@@ -53,7 +53,7 @@ Datasets/
 # How to Run the Code 🛠
 ## Environment Installation
 Our codebase is based on detectron2 and Mask2Former. 
-Please follow the docker file provided in [Dockerfile](Dockerfile)
+Please follow the docker file provided in [Dockerfile](Dockerfile).
 
 ## Model training
 Training is split into two steps: 
