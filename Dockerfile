@@ -15,14 +15,7 @@ EXPOSE 8888
 RUN apt-get update
 RUN apt-get install ffmpeg libsm6 libxext6 -y
 
-#detectron2 install##############
-# RUN pip install 'git+https://github.com/facebookresearch/fvcore'
-# RUN git clone https://github.com/facebookresearch/detectron2 detectron2_repo
-# RUN pip install -e detectron2_repo
-# RUN pip install 'git+https://github.com/facebookresearch/detectron2.git'
-################################
-# RUN pip install git+https://github.com/cocodataset/panopticapi.git
-###############################
+#detectron2 install
 COPY requirements.txt .
 RUN pip install --upgrade pip
 RUN pip install 'git+https://github.com/facebookresearch/detectron2.git'
