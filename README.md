@@ -1,10 +1,8 @@
 # SurgPIS: Surgical-instrument-level Instances and Part-level Semantics for Weakly-supervised Part-aware Instance Segmentation
+SurgPIS redefine the task of surgical instrument segmentation as a unified part-aware instance segmentation problem, and propose SurgPIS, the first model for part-aware instance segmentation of surgical tools.
 
 # Introduction 📑
-
-This project redefine the task of surgical instrument segmentation as a unified part-aware instance segmentation problem, and propose SurgPIS, the first model for part-aware instance segmentation of surgical tools.
-
-Fig. 1. SurgPIS is capable of predicting both instrument-level instances (i.e. IIS and ISS) and part-aware instances (i.e. PIS and PSS) based on a query- based transformation approach. It leverages weak PIS supervision from disjoint PSS and ISS datasets to learn from partially labelled data in different granularities.
+SurgPIS is capable of predicting both instrument-level instances (i.e. IIS and ISS) and part-aware instances (i.e. PIS and PSS) based on a query- based transformation approach. It leverages weak PIS supervision from disjoint PSS and ISS datasets to learn from partially labelled data in different granularities.
 <div align="center">
   <img src="https://github.com/weimengmeng1999/SurgPIS/blob/main/Figures/open.png" width="80%" height="80%"/>
 </div><br/>
