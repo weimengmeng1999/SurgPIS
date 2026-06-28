@@ -1,6 +1,10 @@
 # SurgPIS: Surgical-instrument-level Instances and Part-level Semantics for Weakly-supervised Part-aware Instance Segmentation
 SurgPIS redefine the task of surgical instrument segmentation as a unified part-aware instance segmentation problem, and propose SurgPIS, the first model for part-aware instance segmentation of surgical tools.
 
+# News 📰
+* **[2025]** 🎉 The **stage 1 (fully-supervised PIS) code is now released** to the community! See [Model training](#model-training) to get started.
+* **[Coming soon]** The **stage 2 (weakly-supervised) code will be released upon publication.** Stay tuned!
+
 # Introduction 📑
 SurgPIS is capable of predicting both instrument-level instances (i.e. IIS and ISS) and part-aware instances (i.e. PIS and PSS) based on a query- based transformation approach. It leverages weak PIS supervision from disjoint PSS and ISS datasets to learn from partially labelled data in different granularities.
 <div align="center">
@@ -58,7 +62,11 @@ Training is split into two steps:
 * **Fully-supervised PIS stage (stage 1)** : Fully supervised training for PIS task on EndoVis2018 dataset.
 * **Weakly-supervised stage (stage 2)** : Weakly supervised training for dataset that only has IIS annotations (EndoVis2017) or PSS annotations (SAR-RARP50).
 
+> **Note:** The **stage 1 code is available now**. The **stage 2 (weakly-supervised) code will be released upon publication.** The stage 2 scripts below are provided for reference and will become runnable once that code is released.
+
 The following section provides examples of scripts to train for different stages.
+
+
 
 ### Example with a R50 backbone
 * Example with ResNet-50 as backbone on for stage 1 on 1 GPU.
@@ -68,7 +76,7 @@ The following section provides examples of scripts to train for different stages
     ```
 
 
-* Example with ResNet-50 as backbone for stage 2 on 2 GPUs.
+* Example with ResNet-50 as backbone for stage 2 on 2 GPUs. *(code released upon publication)*
 
     ```
     python3 train_net.py --config-file configs/endovis/instance-part-segmentation/maskformer2_R50_bs16_160k.yaml --num-gpus 2 --num-machines 1 WSL.TRAIN_WSL True WSL.TEACHER_CKPT *OUTPUT/TEACHER/model_final.pth* OUTPUT_DIR *OUTPUT/STUDENT*
@@ -81,7 +89,7 @@ The following section provides examples of scripts to train for different stages
     python3 train_net.py --config-file configs/endovis/instance-part-segmentation/maskformer2_dinov2_base_bs16_50ep.yaml --num-gpus 1 WSL.TRAIN_WSL False OUTPUT_DIR *OUTPUT/TEACHER*
     ```
 
-* Example with ResNet-50 as backbone for stage 2 on 2 GPUs.
+* Example with ResNet-50 as backbone for stage 2 on 2 GPUs. *(code released upon publication)*
 
     ```
     python3 train_net.py --config-file configs/endovis/instance-part-segmentation/maskformer2_dinov2_base_bs16_50ep.yaml --num-gpus 2 --num-machines 1 WSL.TRAIN_WSL True WSL.TEACHER_CKPT *OUTPUT/TEACHER/model_final.pth* OUTPUT_DIR *OUTPUT/STUDENT*
