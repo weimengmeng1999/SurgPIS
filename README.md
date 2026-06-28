@@ -2,7 +2,7 @@
 SurgPIS redefine the task of surgical instrument segmentation as a unified part-aware instance segmentation problem, and propose SurgPIS, the first model for part-aware instance segmentation of surgical tools.
 
 # News 📰
-* **[2025]** 🎉 The **stage 1 (fully-supervised PIS) code is now released** to the community! See [Model training](#model-training) to get started.
+* **[Feb 2026]** 🎉 The **stage 1 (fully-supervised PIS) code is now released** to the community! See [Model training](#model-training) to get started.
 * **[Coming soon]** The **stage 2 (weakly-supervised) code will be released upon publication.** Stay tuned!
 
 # Introduction 📑
