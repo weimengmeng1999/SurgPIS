@@ -62,4 +62,3 @@ DATALOADER:
   NUM_WORKERS: 4
 VERSION: 2
 SAVE_PREDICTIONS: True
-#"/nfs/home/mwei/InspartSeg_output/output_inp"

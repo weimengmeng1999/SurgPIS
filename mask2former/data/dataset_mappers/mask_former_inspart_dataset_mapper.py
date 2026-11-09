@@ -146,7 +146,12 @@ class MaskFormerInspartDatasetMapper:
 
         masks, classes = [], []
         for obj in annos:
-            classes.append(int(obj["category_id"]))
+            # obj["category_id"] is the raw COCO id (1-indexed here) -- load_coco_json is
+            # called without dataset_name in register_endovis_inp.py/register_endovis17_inp.py,
+            # so it's never auto-remapped. Must go through thing_dataset_id_to_contiguous_id
+            # here, or gt_classes ends up shifted by +1 against the classifier's 0-indexed
+            # output space (class 0 never trained, every real class off by one).
+            classes.append(self.meta.thing_dataset_id_to_contiguous_id[int(obj["category_id"])])
             segm = obj["segmentation"]
             if isinstance(segm, list):
                 masks.append(polygons_to_bitmask(segm, *image.shape[:2]))
@@ -162,6 +167,7 @@ class MaskFormerInspartDatasetMapper:
         classes = torch.tensor(classes, dtype=torch.int64)
         masks_ins = [torch.from_numpy(np.ascontiguousarray(x.copy())) for x in masks]
 
+        dataset_dict["valid_image_size"] = tuple(image.shape[:2])
         image = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
         if self.size_divisibility > 0:
             image_size = (image.shape[-2], image.shape[-1])
@@ -214,7 +220,7 @@ class MaskFormerInspartDatasetMapper:
             mask_parts_per_img = []
             part_ids_list_per_img = []
             class_id = classes_np[idx]
-            part_ids = self.meta.train_sids2train_pids[class_id-1]
+            part_ids = self.meta.train_sids2train_pids[class_id]
             for part_id in part_ids:
                 part_mask = sem_seg_gt == map_value(part_id)
                 inst_part_mask = np.logical_and(part_mask, mask)

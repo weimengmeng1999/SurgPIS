@@ -40,6 +40,19 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.DICE_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.MASK_WEIGHT = 20.0
 
+    # part-level mask cost/loss weights, used both in the matcher's cost
+    # matrix and in the supervised loss_mask_parts/loss_dice_parts terms
+    cfg.MODEL.MASK_FORMER.DICE_WEIGHT_PARTS = 1.0
+    cfg.MODEL.MASK_FORMER.MASK_WEIGHT_PARTS = 20.0
+    # whether the bipartite matcher used by the fully-supervised (INP) criterion
+    # should include the part-level mask cost in its cost matrix
+    cfg.MODEL.MASK_FORMER.MATCHER_USE_PARTS = True
+    # number of generic part classes (currently Shaft/Wrist/Clasper), shared by
+    # PartDecoder and SetCriterionWeakSup's PSS aggregation -- single source of
+    # truth so the two can't silently disagree.
+    cfg.MODEL.MASK_FORMER.EXPLICIT_TISSUE_BACKGROUND = False
+    cfg.MODEL.MASK_FORMER.NUM_PART_CLASSES = 3
+
     # transformer config
     cfg.MODEL.MASK_FORMER.NHEADS = 8
     cfg.MODEL.MASK_FORMER.DROPOUT = 0.1
@@ -59,6 +72,7 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON = True
     cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON = False
     cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON = False
+    cfg.MODEL.MASK_FORMER.TEST.PARTPQ_ON = False
     cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD = 0.0
     cfg.MODEL.MASK_FORMER.TEST.OVERLAP_THRESHOLD = 0.0
     cfg.MODEL.MASK_FORMER.TEST.SEM_SEG_POSTPROCESSING_BEFORE_INFERENCE = False

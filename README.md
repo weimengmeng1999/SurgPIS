@@ -1,114 +1,169 @@
 # SurgPIS: Surgical-instrument-level Instances and Part-level Semantics for Weakly-supervised Part-aware Instance Segmentation
-SurgPIS redefine the task of surgical instrument segmentation as a unified part-aware instance segmentation problem, and propose SurgPIS, the first model for part-aware instance segmentation of surgical tools.
 
-# News 📰
-* **[Feb 2026]** 🎉 The **stage 1 (fully-supervised PIS) code is now released** to the community! See [Model training](#model-training) to get started.
-* **[Coming soon]** The **stage 2 (weakly-supervised) code will be released upon publication.** Stay tuned!
+SurgPIS unifies surgical instrument segmentation as part-aware instance segmentation, predicting individual instruments together with their part semantics.
 
-# Introduction 📑
-SurgPIS is capable of predicting both instrument-level instances (i.e. IIS and ISS) and part-aware instances (i.e. PIS and PSS) based on a query- based transformation approach. It leverages weak PIS supervision from disjoint PSS and ISS datasets to learn from partially labelled data in different granularities.
+## News 📰
+
+- **[November 2026]** 🎉 **Model weights are now available**!
+- **[November 2026]** 🚀 The **Stage 2 (weakly supervised) code is now available**! See [Model training](#model-training) to get started.
+- **[November 2026]** 🎉 Our paper has been accepted by **IEEE Transactions on Medical Imaging (TMI)**!
+- **[February 2026]** 🎉 The **Stage 1 (fully supervised PIS) code is now available**!
+
+## Introduction 📑
+
+SurgPIS extends Mask2Former with shared part-query transformations and part-aware instance matching. It predicts instrument instances and their parts, and learns from datasets annotated at different granularities through a teacher–student model.
+
 <div align="center">
-  <img src="https://github.com/weimengmeng1999/SurgPIS/blob/main/Figures/open.png" width="80%" height="80%"/>
-</div><br/>
+  <img src="Figures/open.png" alt="Overview of SurgPIS and surgical instrument segmentation tasks" width="90%" />
+</div>
 
-# Dataset 📊
-The dataset is organized as follows for this code:
+## Results 🖼️
+
+Qualitative comparisons of part-aware instance segmentation. From left to right: ground truth, TAPPS, baseline, and SurgPIS. Highlighted regions show differences in the predicted instrument instances and parts.
+
+<div align="center">
+  <img src="Figures/PT_result.png" alt="Qualitative segmentation comparisons: Ground Truth, TAPPS, Baseline, and Ours" width="100%" />
+</div>
+
+## Dataset 📊
+
+| Training stream | Dataset | Supervision |
+| --- | --- | --- |
+| PIS (Stages 1 and 2) | EndoVis2018 train | Instrument instances and their parts |
+| IIS (Stage 2) | EndoVis2017 train | Instrument instances |
+| PSS (Stage 2) | SAR-RARP50 train | Part semantics |
+
+Validation splits are excluded from training. The expected layout is:
 
 ```text
-Datasets/
-└── EndoVis2018/ (same for EndoVis2017) 
-    ├── train/
-    │   ├── images/
-    │   │   └── *.png (original image files) 
-    │   └── pss_annotations/
-    │   │   └── *.png (part-level semantic (PSS) annotation files) 
-    │   └── pis_annotations/
-    │       └── *.png (part-level instance (PIS) annotation files) 
-    ├── test/
-    │   ├── images/
-    │   │   └── *.png (original image files) 
-    │   └── pss_annotations/
-    │   │   └── *.png (part-level semantic (PSS) annotation files) 
-    │   └── pis_annotations/
-    │       └── *.png (part-level instance (PIS) annotation files) 
-    │   └── endovis_instance_train.json
-    │   └── endovis_instance_test.json
-└── SAR-RARP50/ 
-    ├── train/
-    │   ├── images/
-    │   │   └── *.png (original image files) 
-    │   └── pss_annotations/
-    |   |   └── *.png (part-level semantic (PSS) annotation files) 
-    ├── test/
-    │   ├── images/
-    │   │   └── *.png (original image files) 
-    │   └── pss_annotations/
-            └── *.png (part-level semantic (PSS) annotation files) 
-└── GraSP/ 
-    └── test/
-        ├── images/
-        │   └── *.png (original image files) 
-        └── pis_annotations/
-            └── *.png (part-level instance (PIS) annotation files) 
+datasets/
+  EndoVis2018/
+    endovis_instance_train.json
+    endovis_instance_val.json
+    train/images/*.png
+    train/part_annotations/*.png
+    val/images/*.png
+    val/part_annotations/*.png
+  EndoVis2017/
+    endovis_instance_train.json
+    endovis_instance_val.json
+    train/images/*.png
+    val/images/*.png
+    val/part_annotations/*.png  # only needed for PIS/PartPQ evaluation
+  SAR-RARP50/
+    train/images/*.png
+    train/annotations_pss/*.png
+    test/images/*.png
+    test/annotations_pss/*.png
 ```
 
-# How to Run the Code 🛠
-## Environment Installation
-Our codebase is based on detectron2 and Mask2Former. 
-Please follow the docker file provided in [Dockerfile](Dockerfile).
+Set these paths before launching training:
+
+```bash
+export ENDOVIS18_ROOT=/path/to/EndoVis2018
+export ENDOVIS17_ROOT=/path/to/EndoVis2017
+export SAR_RARP50_ROOT=/path/to/SAR-RARP50
+```
+
+Alternatively, place these directories under `datasets/`, or set `DETECTRON2_DATASETS`. See [dataset preparation](docs/DATASETS.md). Defaults use EndoVis18 **train** for PIS, EndoVis17 **train** for IIS, and SAR-RARP50 **train** for PSS. Validation is excluded from training. These sources must contain disjoint images; changing catalog names alone does not guarantee disjointness.
+
+## How to Run the Code 🛠
+
+### Environment installation
+
+The codebase builds on Detectron2 and Mask2Former. Follow [install.md](install.md); a [Dockerfile](Dockerfile) is also provided. Dataset files and model weights are not bundled with this source repository.
 
 ## Model training
-Training is split into two steps: 
-* **Fully-supervised PIS stage (stage 1)** : Fully supervised training for PIS task on EndoVis2018 dataset.
-* **Weakly-supervised stage (stage 2)** : Weakly supervised training for dataset that only has IIS annotations (EndoVis2017) or PSS annotations (SAR-RARP50).
 
-> **Note:** The **stage 1 code is available now**. The **stage 2 (weakly-supervised) code will be released upon publication.** The stage 2 scripts below are provided for reference and will become runnable once that code is released.
+### Stage 1: fully supervised PIS
 
-The following section provides examples of scripts to train for different stages.
-
-
-
-### Example with a R50 backbone
-* Example with ResNet-50 as backbone on for stage 1 on 1 GPU.
-
-    ```
-    python3 train_net.py --config-file configs/endovis/instance-part-segmentation/maskformer2_R50_bs16_160k.yaml --num-gpus 1 WSL.TRAIN_WSL False OUTPUT_DIR *OUTPUT/TEACHER*
-    ```
-
-
-* Example with ResNet-50 as backbone for stage 2 on 2 GPUs. *(code released upon publication)*
-
-    ```
-    python3 train_net.py --config-file configs/endovis/instance-part-segmentation/maskformer2_R50_bs16_160k.yaml --num-gpus 2 --num-machines 1 WSL.TRAIN_WSL True WSL.TEACHER_CKPT *OUTPUT/TEACHER/model_final.pth* OUTPUT_DIR *OUTPUT/STUDENT*
-    ```
-
-### Example with a a DINOv2 pre-trained backbone
-* Example with DINOv2 pre-trained ViT-B as backbone on for stage 1 on 1 GPU.
-
-    ```
-    python3 train_net.py --config-file configs/endovis/instance-part-segmentation/maskformer2_dinov2_base_bs16_50ep.yaml --num-gpus 1 WSL.TRAIN_WSL False OUTPUT_DIR *OUTPUT/TEACHER*
-    ```
-
-* Example with ResNet-50 as backbone for stage 2 on 2 GPUs. *(code released upon publication)*
-
-    ```
-    python3 train_net.py --config-file configs/endovis/instance-part-segmentation/maskformer2_dinov2_base_bs16_50ep.yaml --num-gpus 2 --num-machines 1 WSL.TRAIN_WSL True WSL.TEACHER_CKPT *OUTPUT/TEACHER/model_final.pth* OUTPUT_DIR *OUTPUT/STUDENT*
-    ```
-## Model evaluation
-Add 'eval_only' to evaluate the corresponding experiments, and define which model that you want to evaluate by changing 'WSL.EVAL_WHO'
-
-* Example with ResNet-50 as backbone on for stage 1 on 1 GPU.
-
-    ```
-    python train_net.py --config-file configs/endovis/instance-part-segmentation/maskformer2_R50_bs16_160k.yaml --num-gpus 1 --eval-only MODEL.WEIGHTS /nfs/home/mwei/SurgPIS_output/output_inp_13/model_0027999.pth WSL.TRAIN_WSL False WSL.EVAL_WHO TEACHER
-    ```
-
-# Citation 📖
-If you find our work useful or relevant to your research, please consider citing:
+```bash
+NUM_GPUS=2 bash stage1.sh
 ```
-@article{wei2025SurgPIS,
+
+### Stage 2: weak supervision from IIS and PSS
+
+```bash
+NUM_GPUS=2 STAGE1_CHECKPOINT=output/stage1/model_final.pth bash stage2.sh
+```
+
+The student and teacher both load the stage-1 trained weights. The teacher uses EMA with decay 0.9996 and no burn-in. Each step includes a supervised PIS batch; weak steps alternate IIS and PSS batches. Both weak streams also apply teacher PIS consistency losses.
+
+The default ResNet-50 configurations use 40,000 training steps and a total batch size of 16. You can override the settings at launch:
+
+```bash
+OUTPUT_DIR=output/stage1_custom bash stage1.sh SOLVER.IMS_PER_BATCH 4 SOLVER.MAX_ITER 40000
+RESUME=1 bash stage2.sh
+```
+
+`CONFIG`, `NUM_GPUS`, `PYTHON`, `OUTPUT_DIR`, and `RESUME` are environment overrides. Resuming restores model, optimizer, scheduler, iteration and AMP state from that output directory. GPU count does not automatically change the total batch size.
+
+## Model evaluation
+
+### Evaluate or use the released Stage-1 R50 weights
+
+The public weights are available at [oliviamw/SurgPIS-Stage1-R50](https://huggingface.co/oliviamw/SurgPIS-Stage1-R50). They require the explicit-tissue configuration `configs/endovis/instance-part-segmentation/stage1_R50_pretrained.yaml`; the generic stage-1 config is not compatible with this checkpoint.
+
+After installing the dependencies, run from this repository root:
+
+```bash
+export ENDOVIS17_ROOT=/path/to/EndoVis2017
+export ENDOVIS18_ROOT=/path/to/EndoVis2018
+python tools/evaluate_pretrained_stage1.py
+```
+
+This evaluates the released weights on the EndoVis 2017 and 2018 validation sets. Make sure CUDA is available and both datasets are prepared as described in [Dataset files and labels](docs/DATASETS.md).
+
+For a file already downloaded from Hugging Face:
+
+```bash
+python tools/evaluate_pretrained_stage1.py --checkpoint /path/to/surgpis_stage1_r50.pth
+```
+
+Evaluation results are saved in `output/stage1_pretrained/verification.json`. You can also use these weights for inference or to initialize Stage 2. To train your own Stage-1 model, follow the [Stage 1 instructions](#stage-1-fully-supervised-pis).
+
+Stage 1 stores its trained model under the `TEACHER` checkpoint slot; this is not an EMA teacher. Stage 2 stores both `TEACHER` and `STUDENT`.
+
+```bash
+python train_net.py --config-file configs/endovis/instance-part-segmentation/stage1_R50.yaml \
+  --eval-only --num-gpus 1 MODEL.WEIGHTS output/stage1/model_final.pth \
+  WSL.EVAL_WHO TEACHER DATASETS.TEST "('endovis_inp_val',)"
+```
+
+For TAPPS-adapted PartPQ on classes with available parts:
+
+```bash
+python tools/audit_partpq_tapps.py \
+  --reference tools/reference_tapps/evaluation_PartPQ.py \
+  --checkpoint output/stage2/model_final.pth --model TEACHER --offsets 0 \
+  --datasets endovis_inp_val endovis17_inp_val --output-dir output/partpq
+```
+
+EndoVis17 PartPQ evaluation additionally requires part annotations; IIS-only training does not. Do not use the legacy `-1` class offset for newly trained checkpoints. The ordinary dataset evaluators and TAPPS-adapted PartPQ are different metrics.
+
+## Repository structure
+
+The code is organized into `surgpis_config/`, `configs/`, `mask2former/`, `modules/`, `tools/`, `demo_inspart/`, and `Figures/`. `surgpis_config/` contains Python configuration definitions; `configs/` contains YAML model and training recipes. Training options use the `WSL` configuration namespace.
+
+- `stage1.sh`: fully supervised PIS training.
+- `stage2.sh`: PIS + IIS + PSS training initialized from stage 1.
+- `train_net.py`: training and evaluation entry point.
+- `docs/DATASETS.md`: expected files and label conventions.
+
+## Citation 📖
+
+If you find SurgPIS useful, please cite our work:
+
+```bibtex
+@article{wei2026surgpis,
   title={SurgPIS: Surgical-instrument-level Instances and Part-level Semantics for Weakly-supervised Part-aware Instance Segmentation},
-  author={Meng Wei, Charlie Budd, Oluwatosin Alabi, Miaojing Shi, and Tom Vercauteren},
-  year={2025},
+  author={Wei, Meng and Budd, Charlie and Alabi, Oluwatosin and Shi, Miaojing and Vercauteren, Tom},
+  journal={IEEE Transactions on Medical Imaging},
+  year={2026},
+  publisher={IEEE}
 }
 ```
+
+## Acknowledgements
+
+This implementation builds on Mask2Former and Detectron2. Original source headers and license files are retained. The TAPPS-adapted reference evaluator is in `tools/reference_tapps/`.

@@ -1,5 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-# Modified by Bowen Cheng from https://github.com/facebookresearch/detr/blob/master/models/detr.py
+# Copyright: SurgPIS- Meng Wei
 """
 MaskFormer criterion.
 """
@@ -8,6 +7,7 @@ import logging
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.cuda.amp import autocast
 import numpy as np
 from detectron2.utils.comm import get_world_size
 from detectron2.projects.point_rend.point_features import (
@@ -40,9 +40,12 @@ def dice_loss(
     return loss.sum() / num_masks
 
 
-dice_loss_jit = torch.jit.script(
-    dice_loss
-)  # type: torch.jit.ScriptModule
+
+# NOTE: previously torch.jit.script-wrapped for a minor speedup, but the
+# scripted version crashes non-deterministically under newer torch/CUDA
+# ("RuntimeError: Global alloc not supported yet" from the legacy JIT fuser)
+# on certain ragged-batch shapes. Same math, eager mode, no crash.
+dice_loss_jit = dice_loss
 
 
 def sigmoid_ce_loss(
@@ -65,9 +68,7 @@ def sigmoid_ce_loss(
     return loss.mean(1).sum() / num_masks
 
 
-sigmoid_ce_loss_jit = torch.jit.script(
-    sigmoid_ce_loss
-)  # type: torch.jit.ScriptModule
+sigmoid_ce_loss_jit = sigmoid_ce_loss  # see note above dice_loss_jit
 
 
 def calculate_uncertainty(logits):
@@ -241,6 +242,10 @@ class SetCriterion(nn.Module):
         else:
             masks_parts_gt = torch.zeros_like(masks_parts)
 
+        if masks_parts.numel() == 0:
+            zero = masks_parts.sum() * 0.0
+            return {"loss_mask_parts": zero, "loss_dice_parts": zero}
+
         # Apply losses as usual
         src_masks_parts = masks_parts[:, None]
         tgt_masks_parts = masks_parts_gt[:, None]
@@ -312,9 +317,10 @@ class SetCriterion(nn.Module):
         targets = targets_instances
         # print('targets["labels"]', targets[0]["labels"])
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
+        mask_features = outputs["mask_features"]
 
         # Retrieve the matching between the outputs of the last layer and the targets
-        indices = self.matcher(outputs_without_aux, targets)
+        indices = self.matcher(outputs_without_aux, targets, mask_features=mask_features)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_masks = sum(len(t["labels"]) for t in targets)
@@ -331,7 +337,6 @@ class SetCriterion(nn.Module):
             losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
 
             queries = outputs_without_aux["decoder_output"]
-            mask_features = outputs["mask_features"]
             losses_parts = self.loss_masks_parts(queries,
                                                     mask_features,
                                                     targets,
@@ -341,14 +346,13 @@ class SetCriterion(nn.Module):
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if "aux_outputs" in outputs:
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
-                indices = self.matcher(aux_outputs, targets)
+                indices = self.matcher(aux_outputs, targets, mask_features=mask_features)
                 for loss in self.losses:
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks)
                     l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
                     
                     queries = aux_outputs["decoder_output"]
-                    mask_features = outputs["mask_features"]
                     l_dict.update(self.loss_masks_parts(queries, mask_features, targets, indices))
                     l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
@@ -371,17 +375,17 @@ class SetCriterion(nn.Module):
         lines = [head] + [" " * _repr_indent + line for line in body]
         return "\n".join(lines)
 
-        
 
-class SetCriterionISS(nn.Module):
-    """This class computes the loss for DETR.
-    The process happens in two steps:
-        1) we compute hungarian assignment between ground truth boxes and the outputs of the model
-        2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
+class SetCriterionWeakSup(nn.Module):
+    """Weakly-supervised (stage-2) loss: a student-teacher consistency loss
+    against the teacher's pseudo-labels, combined with a loss against
+    whichever partial ground truth is available for a given training image --
+    IIS instance labels (`forward`) or PSS part-semantic labels (`forward_pss`).
     """
 
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
-                 num_points, oversample_ratio, importance_sample_ratio, deep_supervision=True):
+                 num_points, oversample_ratio, importance_sample_ratio, parts_decoder,
+                 num_part_classes=3, explicit_tissue_background=False):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -389,252 +393,8 @@ class SetCriterionISS(nn.Module):
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
             eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
-        """
-        super().__init__()
-        self.num_classes = num_classes
-        self.matcher = matcher
-        self.weight_dict = weight_dict
-        self.eos_coef = eos_coef
-        self.losses = losses
-        empty_weight = torch.ones(self.num_classes + 1)
-        empty_weight[-1] = self.eos_coef
-        self.register_buffer("empty_weight", empty_weight)
-
-        # pointwise mask loss parameters
-        self.num_points = num_points
-        self.oversample_ratio = oversample_ratio
-        self.importance_sample_ratio = importance_sample_ratio
-
-        self.deep_supervision = deep_supervision
-
-    def loss_labels(self, outputs, targets, indices, num_masks):
-        """Classification loss (NLL)
-        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
-        """
-        assert "pred_logits" in outputs
-        src_logits = outputs["pred_logits"].float()
-        idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(
-            src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
-        )
-        target_classes[idx] = target_classes_o
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
-        losses = {"loss_ce": loss_ce}
-        return losses
-    
-    def loss_masks(self, outputs, targets, indices, num_masks):
-        """Compute the losses related to the masks: the focal loss and the dice loss.
-        targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
-        """
-        assert "pred_masks" in outputs
-
-        src_idx = self._get_src_permutation_idx(indices)
-        tgt_idx = self._get_tgt_permutation_idx(indices)
-        src_masks = outputs["pred_masks"]
-        src_masks = src_masks[src_idx]
-        masks = [t["masks"] for t in targets]
-        # TODO use valid to mask invalid areas due to padding in loss
-        target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
-        target_masks = target_masks.to(src_masks)
-        target_masks = target_masks[tgt_idx]
-
-        # No need to upsample predictions as we are using normalized coordinates :)
-        # N x 1 x H x W
-        src_masks = src_masks[:, None]
-        target_masks = target_masks[:, None]
-        # print('mask shapes ', src_masks.shape, target_masks.shape)
-
-        with torch.no_grad():
-            # sample point_coords
-            point_coords = get_uncertain_point_coords_with_randomness(
-                src_masks,
-                lambda logits: calculate_uncertainty(logits),
-                self.num_points,
-                self.oversample_ratio,
-                self.importance_sample_ratio,
-            )
-            # get gt labels
-            point_labels = point_sample(
-                target_masks,
-                point_coords,
-                align_corners=False,
-            ).squeeze(1)
-
-        point_logits = point_sample(
-            src_masks,
-            point_coords,
-            align_corners=False,
-        ).squeeze(1)
-        
-        # print(point_logits.shape, point_labels.shape, num_masks)
-
-        losses = {
-            "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
-            "loss_dice": dice_loss_jit(point_logits, point_labels, num_masks),
-        }
-
-        del src_masks
-        del target_masks
-        return losses
-    
-    def loss_masks_semantic(self, outputs, targets):
-        """Compute the losses related to the masks: the focal loss and the dice loss.
-        targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
-        """
-        assert "pred_masks" in outputs
-
-        mask_cls_iss = outputs["pred_logits"]
-        print(mask_cls_iss.size())
-        mask_pred_iss = outputs["pred_masks"]
-        print(mask_pred_iss.size())
-        mask_cls_iss = F.softmax(mask_cls_iss, dim=-1)
-        mask_pred_iss = mask_pred_iss.sigmoid()
-        src_masks = torch.einsum("bqc,bqhw->bchw", mask_cls_iss, mask_pred_iss).float()
-        print(src_masks.size())
-        masks = [t["masks"] for t in targets]
-        num_masks = len(masks)
-        # TODO use valid to mask invalid areas due to padding in loss
-        target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
-        target_masks = target_masks.to(src_masks)
-
-        # No need to upsample predictions as we are using normalized coordinates :)
-        # N x 1 x H x W
-        src_masks = src_masks[:, None]
-        target_masks = target_masks[:, None]
-
-        with torch.no_grad():
-            # sample point_coords
-            point_coords = get_uncertain_point_coords_with_randomness(
-                src_masks,
-                lambda logits: calculate_uncertainty(logits),
-                self.num_points,
-                self.oversample_ratio,
-                self.importance_sample_ratio,
-            )
-            # get gt labels
-            point_labels = point_sample(
-                target_masks,
-                point_coords,
-                align_corners=False,
-            ).squeeze(1)
-
-        point_logits = point_sample(
-            src_masks,
-            point_coords,
-            align_corners=False,
-        ).squeeze(1)
-
-        losses = {
-            "loss_mask_semantic": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
-            "loss_dice_semantic": dice_loss_jit(point_logits, point_labels, num_masks),
-        }
-
-        del mask_cls_iss
-        del mask_pred_iss
-        del src_masks
-        del target_masks
-        return losses
-
-    def _get_src_permutation_idx(self, indices):
-        # permute predictions following indices
-        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-        src_idx = torch.cat([src for (src, _) in indices])
-        return batch_idx, src_idx
-
-    def _get_tgt_permutation_idx(self, indices):
-        # permute targets following indices
-        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
-        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
-        return batch_idx, tgt_idx
-
-    def get_loss(self, loss, outputs, targets, indices, num_masks):
-        loss_map = {
-            'labels': self.loss_labels,
-            'masks': self.loss_masks,
-        }
-        assert loss in loss_map, f"do you really want to compute {loss} loss?"
-        return loss_map[loss](outputs, targets, indices, num_masks)
-
-    def forward(self, outputs, targets, targets_sem):
-        """This performs the loss computation.
-        Parameters:
-             outputs: dict of tensors, see the output specification of the model for the format
-             targets: list of dicts, such that len(targets) == batch_size.
-                      The expected keys in each dict depends on the losses applied, see each loss' doc
-        """
-        outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
-
-        # Retrieve the matching between the outputs of the last layer and the targets
-        indices = self.matcher(outputs_without_aux, targets)
-
-        # Compute the average number of target boxes accross all nodes, for normalization purposes
-        num_masks = sum(len(t["labels"]) for t in targets)
-        num_masks = torch.as_tensor(
-            [num_masks], dtype=torch.float, device=next(iter(outputs.values())).device
-        )
-        if is_dist_avail_and_initialized():
-            torch.distributed.all_reduce(num_masks)
-        num_masks = torch.clamp(num_masks / get_world_size(), min=1).item()
-
-        # Compute all the requested losses
-        losses = {}
-        for loss in self.losses:
-            losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
-        
-            losses_iss = self.loss_masks_semantic(outputs_without_aux, targets_sem)
-            losses.update(losses_iss)
-
-
-        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
-        if self.deep_supervision and "aux_outputs" in outputs:
-            for i, aux_outputs in enumerate(outputs["aux_outputs"]):
-                indices = self.matcher(aux_outputs, targets)
-                for loss in self.losses:
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks)
-                    l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
-                    losses.update(l_dict)
-
-                    l_dict.update(self.loss_masks_semantic(aux_outputs, targets_sem))
-                    l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
-                    losses.update(l_dict)
-
-        return losses
-
-    def __repr__(self):
-        head = "Criterion " + self.__class__.__name__
-        body = [
-            "matcher: {}".format(self.matcher.__repr__(_repr_indent=8)),
-            "losses: {}".format(self.losses),
-            "weight_dict: {}".format(self.weight_dict),
-            "num_classes: {}".format(self.num_classes),
-            "eos_coef: {}".format(self.eos_coef),
-            "num_points: {}".format(self.num_points),
-            "oversample_ratio: {}".format(self.oversample_ratio),
-            "importance_sample_ratio: {}".format(self.importance_sample_ratio),
-        ]
-        _repr_indent = 4
-        lines = [head] + [" " * _repr_indent + line for line in body]
-        return "\n".join(lines)
-
-
-
-class SetCriterionIIS(nn.Module):
-    """This class computes the loss for DETR.
-    The process happens in two steps:
-        1) we compute hungarian assignment between ground truth boxes and the outputs of the model
-        2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
-    """
-
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
-                 num_points, oversample_ratio, importance_sample_ratio, parts_decoder):
-        """Create the criterion.
-        Parameters:
-            num_classes: number of object categories, omitting the special no-object category
-            matcher: module able to compute a matching between targets and proposals
-            weight_dict: dict containing as key the names of the losses and as values their relative weight.
-            eos_coef: relative classification weight applied to the no-object category
-            losses: list of all the losses to be applied. See get_loss for list of available losses.
+            num_part_classes: number of generic part classes (e.g. 3 for shaft/wrist/clasper),
+                used by the PSS part-semantic-map aggregation.
         """
         super().__init__()
         self.num_classes = num_classes
@@ -652,6 +412,8 @@ class SetCriterionIIS(nn.Module):
         self.importance_sample_ratio = importance_sample_ratio
 
         self.parts_decoder = parts_decoder
+        self.num_part_classes = num_part_classes
+        self.explicit_tissue_background = explicit_tissue_background
 
     def loss_labels(self, outputs, targets, indices, num_masks, pseudo = False):
         """Classification loss (NLL)
@@ -662,15 +424,24 @@ class SetCriterionIIS(nn.Module):
 
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(
-            src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
-        )
-        target_classes[idx] = target_classes_o
 
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         if pseudo:
+            # Consistency loss against the teacher's pseudo-labels: an
+            # unmatched query may just be an instance the (imperfect) teacher
+            # missed, not genuine background. Defaulting it to no-object here
+            # would train the student to copy the teacher's misses rather
+            # than only its confident hits, so only supervise matched queries.
+            if target_classes_o.numel() > 0:
+                loss_ce = F.cross_entropy(src_logits[idx], target_classes_o, self.empty_weight)
+            else:
+                loss_ce = src_logits.sum() * 0.0
             losses = {"loss_ce_pd": loss_ce}
         else:
+            target_classes = torch.full(
+                src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
+            )
+            target_classes[idx] = target_classes_o
+            loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
             losses = {"loss_ce": loss_ce}
         return losses
     
@@ -786,6 +557,10 @@ class SetCriterionIIS(nn.Module):
         else:
             masks_parts_gt = torch.zeros_like(masks_parts)
 
+        if masks_parts.numel() == 0:
+            zero = masks_parts.sum() * 0.0
+            return {"loss_mask_parts_pd": zero, "loss_dice_parts_pd": zero}
+
         # Apply losses as usual
         src_masks_parts = masks_parts[:, None]
         tgt_masks_parts = masks_parts_gt[:, None]
@@ -827,6 +602,138 @@ class SetCriterionIIS(nn.Module):
 
         return losses
 
+    def teacher_consistency_losses(self, layer_outputs, mask_features, targets_pseudo, suffix=""):
+        """Student-teacher consistency loss: the same instrument class/mask/dice
+        + part mask/dice terms as the fully supervised loss (SetCriterion), but
+        matched against the teacher's pseudo-labels instead of real ground
+        truth. Shared by both the IIS (`forward`) and PSS (`forward_pss`)
+        branches, since this term doesn't depend on which partial ground truth
+        accompanies the image.
+        """
+        indices_pd = self.matcher(layer_outputs, targets_pseudo)
+
+        num_masks_pd = sum(len(t["labels"]) for t in targets_pseudo)
+        num_masks_pd = torch.as_tensor(
+            [num_masks_pd], dtype=torch.float, device=layer_outputs["pred_logits"].device
+        )
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(num_masks_pd)
+        num_masks_pd = torch.clamp(num_masks_pd / get_world_size(), min=1).item()
+
+        losses = {}
+        for loss in self.losses:
+            losses.update(self.get_loss(loss, layer_outputs, targets_pseudo, indices_pd, num_masks_pd, pseudo=True))
+
+        queries = layer_outputs["decoder_output"]
+        losses.update(self.loss_masks_parts(queries, mask_features, targets_pseudo, indices_pd))
+
+        if suffix:
+            losses = {k + suffix: v for k, v in losses.items()}
+        return losses
+
+    def aggregate_part_semantic_map(self, pred_logits, pred_masks, part_masks_dense):
+        """Builds a soft part-level semantic map from every query's
+        instrument-class probability and part-mask predictions.
+
+        pred_logits: [Nb, Q, num_classes+1], last channel = no-object.
+        pred_masks: [Nb, Q, H, W], instrument-level mask logits.
+        part_masks_dense: [Nb, Q, num_part_classes, H, W], from
+            PartDecoder.compute_part_masks_dense -- already generic
+            (channel k = k-th part regardless of instrument identity).
+
+        Returns s_hat: [Nb, num_part_classes+1, H, W], channel 0 = background,
+        channels 1..num_part_classes follow the part-decoder's own order.
+        """
+        assert part_masks_dense.shape[2] == self.num_part_classes, (
+            f"PartDecoder produced {part_masks_dense.shape[2]} part channels but this "
+            f"criterion was configured with num_part_classes={self.num_part_classes} -- "
+            "they must be built from the same cfg.MODEL.MASK_FORMER.NUM_PART_CLASSES."
+        )
+        # rho_bg below is a product over all Q queries -- under fp16 autocast
+        # this underflows to exactly 0 once roughly a dozen queries have
+        # moderate-to-high overlapping confidence at the same pixel (common at
+        # busy instance-boundary regions), which kills its gradient right where
+        # mask precision matters most. Force fp32 for this whole computation.
+        with autocast(enabled=False):
+            pred_logits = pred_logits.float()
+            pred_masks = pred_masks.float()
+            part_masks_dense = part_masks_dense.float()
+
+            probs = F.softmax(pred_logits, dim=-1)  # [Nb, Q, C+1]
+            bg_idx = probs.shape[-1] - 1
+            y = pred_masks.sigmoid()  # [Nb, Q, H, W]
+            m = part_masks_dense.sigmoid()  # [Nb, Q, K, H, W]
+
+            # most probable class per query (may itself be no-object); only
+            # queries whose argmax is a real instrument contribute to the parts
+            gamma = probs.argmax(dim=-1)  # [Nb, Q]
+            is_fg = (gamma != bg_idx)
+            if self.explicit_tissue_background:
+                is_fg = is_fg & (gamma != 0)
+            is_fg = is_fg.to(probs.dtype)
+            c_gamma = probs.gather(-1, gamma.unsqueeze(-1)).squeeze(-1)  # [Nb, Q]
+            weight = is_fg * c_gamma
+            
+            claim = weight.unsqueeze(-1).unsqueeze(-1) * y  # [Nb, Q, H, W], each in [0,1]
+            if self.explicit_tissue_background:
+                rho_bg = torch.einsum("bq,bqhw->bhw", probs[..., 0], y)
+            else:
+                rho_bg = torch.prod(1 - claim, dim=1)  # [Nb, H, W]
+
+            rho_parts = torch.einsum("bq,bqkhw->bkhw", weight, m)  # [Nb, K, H, W]
+
+            rho = torch.cat([rho_bg.unsqueeze(1), rho_parts], dim=1)  # [Nb, K+1, H, W]
+            s_hat = rho / rho.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        return s_hat
+
+    def loss_pss_semantic(self, outputs, mask_features, targets_pss):
+        """Compares the aggregated part-semantic map against ground-truth
+        part-semantic labels, one channel per part class, averaged over the
+        num_part_classes parts (background is excluded from this average --
+        it's only used inside aggregate_part_semantic_map to build s_hat).
+        targets_pss entries carry a "sem_seg" [H, W] long tensor with class ids
+        0..num_part_classes and 255 (ignore) for pixels belonging to neither
+        background nor a modelled part.
+        """
+        part_masks_dense = self.parts_decoder.compute_part_masks_dense(
+            outputs["decoder_output"], mask_features
+        )
+        s_hat = self.aggregate_part_semantic_map(
+            outputs["pred_logits"], outputs["pred_masks"], part_masks_dense
+        )
+
+        sem_seg_gt = torch.stack([t["sem_seg"] for t in targets_pss]).to(device=s_hat.device)
+        if s_hat.shape[-2:] != sem_seg_gt.shape[-2:]:
+            s_hat = F.interpolate(s_hat, size=sem_seg_gt.shape[-2:], mode="bilinear", align_corners=False)
+
+        valid = sem_seg_gt != 255
+        num_part_classes = s_hat.shape[1] - 1
+
+        # Keep the zero connected to the graph (via s_hat) rather than a bare
+        # Python float, so a batch with no valid pixels at all (e.g. an
+        # all-ignore crop) still contributes a well-defined, finite loss.
+        zero = s_hat.sum() * 0.0
+        loss_ce = zero
+        loss_dice = zero
+        if valid.any():
+            # s_hat is already a probability (post-sigmoid, renormalized), not
+            # logits, so this needs plain binary_cross_entropy rather than the
+            # logits version -- but that op is disallowed under autocast, so
+            # force fp32 here explicitly.
+            with autocast(enabled=False):
+                for k in range(1, num_part_classes + 1):
+                    pred_k = s_hat[:, k][valid].float().clamp(min=1e-6, max=1 - 1e-6)
+                    gt_k = (sem_seg_gt == k).float()[valid]
+                    loss_ce = loss_ce + F.binary_cross_entropy(pred_k, gt_k)
+                    numerator = 2 * (pred_k * gt_k).sum()
+                    denominator = pred_k.sum() + gt_k.sum()
+                    loss_dice = loss_dice + (1 - (numerator + 1) / (denominator + 1))
+
+        return {
+            "loss_mask_pss": loss_ce / num_part_classes,
+            "loss_dice_pss": loss_dice / num_part_classes,
+        }
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -848,19 +755,15 @@ class SetCriterionIIS(nn.Module):
         return loss_map[loss](outputs, targets, indices, num_masks, pseudo)
 
     def forward(self, outputs, targets_inp, targets_iis):
-        """This performs the loss computation.
-        Parameters:
-             outputs: dict of tensors, see the output specification of the model for the format
-             targets: list of dicts, such that len(targets) == batch_size.
-                      The expected keys in each dict depends on the losses applied, see each loss' doc
+        """IIS branch: instrument class + mask/dice loss against the real weak
+        IIS labels, plus the shared teacher-consistency loss (against the
+        teacher's pseudo-labels, targets_inp).
         """
         targets = targets_iis
-        # print('targets["labels"]', targets[0]["labels"])
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
+        mask_features = outputs["mask_features"]
 
-        # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets)
-        indices_inp = self.matcher(outputs_without_aux, targets_inp)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_masks = sum(len(t["labels"]) for t in targets)
@@ -871,47 +774,52 @@ class SetCriterionIIS(nn.Module):
             torch.distributed.all_reduce(num_masks)
         num_masks = torch.clamp(num_masks / get_world_size(), min=1).item()
 
-        # num_masks_inp = sum(len(t["labels"]) for t in targets_inp)
-        # num_masks_inp = torch.as_tensor(
-        #     [num_masks_inp], dtype=torch.float, device=next(iter(outputs.values())).device
-        # )
-        # if is_dist_avail_and_initialized():
-        #     torch.distributed.all_reduce(num_masks_inp)
-        # num_masks_inp = torch.clamp(num_masks_inp / get_world_size(), min=1).item()
-
-        # Compute all the requested losses
+        # IIS's own direct-GT losses get an "_iis" suffix so they don't share
+        # key names with the supervised branch's loss_ce/loss_mask/loss_dice --
+        # both branches run every iteration and get merged into one dict in
+        # train_loop.py, so identical names would silently overwrite one
+        # another there instead of summing (the actual backward pass isn't
+        # affected either way, since it sums the tensors before that merge,
+        # but logged metrics were losing the IIS branch's own values).
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_masks, False))
-            # losses.update(self.get_loss(loss, outputs, targets_inp, indices_inp, num_masks_inp, True))
-
-            queries = outputs_without_aux["decoder_output"]
-            mask_features = outputs["mask_features"]
-            losses_parts = self.loss_masks_parts(queries,
-                                                    mask_features,
-                                                    targets_inp,
-                                                    indices_inp)
-            losses.update(losses_parts)
+        losses = {k + "_iis": v for k, v in losses.items()}
+        losses.update(self.teacher_consistency_losses(outputs_without_aux, mask_features, targets_inp))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if "aux_outputs" in outputs:
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
                 indices = self.matcher(aux_outputs, targets)
-                indices_inp = self.matcher(aux_outputs, targets_inp)
+                l_dict = {}
                 for loss in self.losses:
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks, False)
-                    l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
-                    losses.update(l_dict)
+                    l_dict.update(self.get_loss(loss, aux_outputs, targets, indices, num_masks, False))
+                l_dict = {k + f"_iis_{i}": v for k, v in l_dict.items()}
+                losses.update(l_dict)
 
-                    # l_dict = self.get_loss(loss, aux_outputs, targets_inp, indices_inp, num_masks_inp, True)
-                    # l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
-                    # losses.update(l_dict)
-                    
-                    queries = aux_outputs["decoder_output"]
-                    mask_features = outputs["mask_features"]
-                    l_dict.update(self.loss_masks_parts(queries, mask_features, targets_inp, indices_inp))
-                    l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
-                    losses.update(l_dict)
+                losses.update(self.teacher_consistency_losses(aux_outputs, mask_features, targets_inp, suffix=f"_{i}"))
+
+        return losses
+
+    def forward_pss(self, outputs, targets_inp, targets_pss):
+        """PSS branch: part-semantic aggregation loss against the real weak
+        PSS labels, plus the shared teacher-consistency loss (against the
+        teacher's pseudo-labels, targets_inp).
+        """
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
+        mask_features = outputs["mask_features"]
+
+        losses = {}
+        losses.update(self.loss_pss_semantic(outputs_without_aux, mask_features, targets_pss))
+        losses.update(self.teacher_consistency_losses(outputs_without_aux, mask_features, targets_inp))
+
+        if "aux_outputs" in outputs:
+            for i, aux_outputs in enumerate(outputs["aux_outputs"]):
+                l_dict = self.loss_pss_semantic(aux_outputs, mask_features, targets_pss)
+                l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
+                losses.update(l_dict)
+
+                losses.update(self.teacher_consistency_losses(aux_outputs, mask_features, targets_inp, suffix=f"_{i}"))
 
         return losses
 

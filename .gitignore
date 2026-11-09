@@ -56,3 +56,22 @@ _darcs
 /snippet
 !/projects/Mask2Former/debug/*.pt
 ./gd_ckpts
+
+# Local datasets and generated experiment artifacts
+datasets/
+output/
+*.pth
+*.pt
+__pycache__/
+*.pyc
+_local_reference/
+.claude/
+
+# Local credentials and agent settings
+.aws/
+.agents/
+.codex/
+.env
+.env.*
+*.pem
+*.key

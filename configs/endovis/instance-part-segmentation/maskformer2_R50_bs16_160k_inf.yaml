@@ -43,4 +43,4 @@ MODEL:
       OVERLAP_THRESHOLD: 0.8
       OBJECT_MASK_THRESHOLD: 0.8
 SAVE_PREDICTIONS: False
-OUTPUT_DIR: "/nfs/home/mwei/GuidedDistillation_output/output_inp_inf"
+OUTPUT_DIR: "output/inference"

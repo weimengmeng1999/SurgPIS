@@ -25,8 +25,8 @@ import torch
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
-# from config.config import get_cfg
-from config.add_cfg import add_wsl_config
+# from surgpis_config.config import get_cfg
+from surgpis_config.add_cfg import add_wsl_config
 from detectron2.data import MetadataCatalog, build_detection_train_loader
 # from data import MetadataCatalog, build_detection_train_loader
 from detectron2.engine import (
@@ -57,6 +57,7 @@ from mask2former import (
     COCOInstanceNewBaselineDatasetMapper,
     COCOPanopticNewBaselineDatasetMapper,
     InstanceSegEvaluator,
+    PartPQEvaluator,
     MaskFormerInstanceDatasetMapper,
     MaskFormerPanopticDatasetMapper,
     MaskFormerSemanticDatasetMapper,
@@ -98,6 +99,8 @@ class Trainer(DefaultTrainer):
         # instance segmentation
         if evaluator_type == "coco":
             evaluator_list.append(COCOEvaluator(dataset_name, output_dir=output_folder))
+            if cfg.MODEL.MASK_FORMER.TEST.PARTPQ_ON:
+                evaluator_list.append(PartPQEvaluator(dataset_name, output_dir=output_folder))
         # panoptic segmentation
         if evaluator_type in [
             "coco_panoptic_seg",
@@ -202,19 +205,43 @@ class Trainer(DefaultTrainer):
             return build_detection_train_loader(cfg, mapper=mapper), build_detection_train_loader(cfg_gan, mapper=mapper_unl)
         # Instance-part dataset mapper
         elif cfg.INPUT.DATASET_MAPPER_NAME == "mask_former_inspart":
+            train_ssl = cfg.WSL.TRAIN_WSL
             cfg.defrost()
+
+            # Stage 1 (WSL.TRAIN_WSL=False) trains on the labeled INP dataset
+            # only, with no dependency on the weak-supervision datasets below
+            # -- so it stays runnable with just the labeled data (e.g. for
+            # open-source replication: stage 1 -> best checkpoint -> stage 2).
+            if not train_ssl:
+                cfg.freeze()
+                mapper = MaskFormerInspartDatasetMapper(cfg, True)
+                return (build_detection_train_loader(cfg, mapper=mapper),)
+
+            # Stage 2: two weak-supervision streams, alternated per-iteration
+            # by SimpleTrainerSSL/AMPTrainerSSL (see modules/train_loop.py):
+            # IIS instance labels (EndoVis-RS17) and PSS part-semantic labels
+            # (SAR_RARP50_seg).
             cfg_gan = cfg.clone()
             cfg_gan.INPUT = cfg.INPUT
-            cfg_gan.DATASETS.TRAIN = ("endovis17_iis_train",)
-            if cfg.WSL.TRAIN_WSL:
-                cfg_gan.DATALOADER.SAMPLER_TRAIN = "TrainingSampler"
+            cfg_gan.DATASETS.TRAIN = (cfg.WSL.IIS_DATASET_TRAIN,)
+            cfg_gan.DATALOADER.SAMPLER_TRAIN = "TrainingSampler"
             cfg_gan.freeze()
+
+            cfg_pss = cfg.clone()
+            cfg_pss.INPUT = cfg.INPUT
+            cfg_pss.DATASETS.TRAIN = (cfg.WSL.PSS_DATASET_TRAIN,)
+            cfg_pss.DATALOADER.SAMPLER_TRAIN = "TrainingSampler"
+            cfg_pss.freeze()
+
             cfg.freeze()
-            # print(cfg_gan)
             mapper = MaskFormerInspartDatasetMapper(cfg, True)
-            # mapper_iss = MaskFormerSemanticDatasetMapper(cfg_gan, True) #ImageDatasetMapper(cfg_gan, True)
             mapper_iis = MaskFormerInstanceDatasetMapper(cfg_gan, True)
-            return build_detection_train_loader(cfg, mapper=mapper), build_detection_train_loader(cfg_gan, mapper=mapper_iis)
+            mapper_pss = MaskFormerSemanticDatasetMapper(cfg_pss, True)
+            return (
+                build_detection_train_loader(cfg, mapper=mapper),
+                build_detection_train_loader(cfg_gan, mapper=mapper_iis),
+                build_detection_train_loader(cfg_pss, mapper=mapper_pss),
+            )
         
         # coco instance segmentation lsj new baseline
         elif cfg.INPUT.DATASET_MAPPER_NAME == "coco_instance_lsj":
@@ -359,7 +386,16 @@ def setup(args):
     add_maskformer2_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
-    cfg.DATASETS.TRAIN = (cfg.DATASETS.TRAIN[0],)
+    # Update dataloader for WSL case. Previously this unconditionally collapsed
+    # DATASETS.TRAIN down to just its first entry (both branches), silently dropping
+    # every other dataset name -- broke any config/override combining multiple
+    # datasets for the supervised branch (e.g. EndoVis2018+EndoVis17 combined).
+    if cfg.WSL.PERCENTAGE != 100:
+        cfg.DATASETS.TRAIN = tuple(f"{name}_{cfg.WSL.PERCENTAGE}" for name in cfg.DATASETS.TRAIN)
+    # else: leave cfg.DATASETS.TRAIN exactly as set by the config file / --opts.
+    # if cfg.WSL.TRAIN_WSL:
+    #     cfg.DATALOADER.SAMPLER_TRAIN = "RepeatFactorTrainingSampler"
+    #     cfg.DATALOADER.REPEAT_THRESHOLD = 10.0
     
     cfg.freeze()
     default_setup(cfg, args)
@@ -367,65 +403,16 @@ def setup(args):
     setup_logger(output=cfg.OUTPUT_DIR, distributed_rank=comm.get_rank(), name="mask2former")
     return cfg
 
-def parse_ckpt(ckpt_dir):
-    if ckpt_dir.startswith('detectron2://'):
-        return 'STUDENT'
-    ckpt = torch.load(ckpt_dir, map_location='cpu')['model']
-    student_keys = False
-    teacher_keys = False
-    
-    # detect which keys are in the ckpt.
-    for k in ckpt.keys():
-        if k.startswith('modelStudent'):
-            student_keys = True
-        if k.startswith('modelTeacher'):
-            teacher_keys = True
-        if student_keys and teacher_keys:
-            break
-
-    if student_keys and teacher_keys:
-        return 'BOTH'
-    elif student_keys:
-        return 'STUDENT'
-    elif teacher_keys:
-        return 'TEACHER'
-    else:
-        return 'NEITHER'
-    
-
 def main(args):
     cfg = setup(args)
 
     if args.eval_only:
         model = Trainer.build_model(cfg)
 
-        trainer = Trainer(cfg)
-        trainer.resume_or_load(resume=args.resume)
-
-        # Load checkpoint to the appropriate model.
-        if cfg.WSL.TRAIN_WSL:
-            which = parse_ckpt(cfg.MODEL.WEIGHTS)
-            if which == 'BOTH':
-                checkp = trainer._trainer.ensemble_model
-            elif which == 'STUDENT':
-                checkp = trainer._trainer.ensemble_model.modelStudent
-            elif which == 'TEACHER':
-                checkp = trainer._trainer.ensemble_model.modelTeacher
-            else:
-                checkp = trainer._trainer.ensemble_model.modelStudent
-        else:
-            checkp = trainer._trainer.ensemble_model #model
-
-        DetectionCheckpointer(checkp, save_dir=cfg.OUTPUT_DIR).resume_or_load(
-            cfg.MODEL.WEIGHTS, resume=args.resume
-        )
-
-        # Choose which model to evaluate according to the evaluation target parameter.
-        eval_tar = cfg.WSL.EVAL_WHO
-        if eval_tar == 'STUDENT':
-            model = trainer._trainer.ensemble_model.modelStudent
-        else:
-            model = trainer._trainer.ensemble_model.modelTeacher
+        from modules.eval_checkpoint import EvaluationCheckpointer
+        EvaluationCheckpointer(
+            model, eval_target=cfg.WSL.EVAL_WHO, save_dir=cfg.OUTPUT_DIR
+        ).resume_or_load(cfg.MODEL.WEIGHTS, resume=args.resume)
 
         res = Trainer.test(cfg, model)
         if cfg.TEST.AUG.ENABLED:

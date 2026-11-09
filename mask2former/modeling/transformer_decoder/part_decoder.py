@@ -35,8 +35,12 @@ class PartDecoder(nn.Module):
 
     self.mask_head = MLP(input_dim, hidden_dim, mask_dim * num_part_classes, num_layers=3)
 
-  def forward(self, queries, num_parts_per_query, mask_features, part_ids_per_query=None):
+  def compute_part_masks_dense(self, queries, mask_features):
     # queries shape: [Nb, num_queries (padded to max), hidden_dim]
+    # mask_features shape: [Nb, num_channels, height, width]
+    # returns: [Nb, num_queries, num_part_classes, height, width], i.e. the
+    # part mask prediction for every query against every fixed part class,
+    # with no gathering/selection applied.
 
     mask_embeds = self.mask_head(queries)
     mask_embeds = torch.tensor_split(mask_embeds, self.num_part_classes, dim=2)
@@ -58,6 +62,12 @@ class PartDecoder(nn.Module):
                                      embeds_shape[2],
                                      outputs_mask.shape[2],
                                      outputs_mask.shape[3])
+
+    return outputs_mask
+
+  def forward(self, queries, num_parts_per_query, mask_features, part_ids_per_query=None):
+    # queries shape: [Nb, num_queries (padded to max), hidden_dim]
+    outputs_mask = self.compute_part_masks_dense(queries, mask_features)
 
     # num_parts_per_query: list of length batch_size
     gather_batch_dim = []

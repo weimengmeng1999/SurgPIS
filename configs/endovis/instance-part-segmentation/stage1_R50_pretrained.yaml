@@ -1,0 +1,22 @@
+# Configuration for oliviamw/SurgPIS-Stage1-R50 (explicit tissue background).
+_BASE_: stage1_R50.yaml
+MODEL:
+  WEIGHTS: ""
+  SEM_SEG_HEAD:
+    NUM_CLASSES: 10
+  MASK_FORMER:
+    EXPLICIT_TISSUE_BACKGROUND: True
+    MASK_WEIGHT_PARTS: 1.0
+    DICE_WEIGHT_PARTS: 1.0
+    TEST:
+      OBJECT_MASK_THRESHOLD: 0.8
+      OVERLAP_THRESHOLD: 0.8
+      INSTANCE_ON: True
+      PANOPTIC_ON: True
+DATASETS:
+  TEST: ("endovis17_inp_val", "endovis_inp_val")
+DATALOADER:
+  NUM_WORKERS: 0
+SEED: 42
+SAVE_PREDICTIONS: False
+OUTPUT_DIR: output/stage1_pretrained

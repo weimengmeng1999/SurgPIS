@@ -28,7 +28,7 @@ import detectron2.utils.comm as comm
 from detectron2.engine import default_setup
 
 from mask2former import add_maskformer2_config
-from config.add_cfg import add_ssl_config
+from surgpis_config.add_cfg import add_wsl_config
 from predictor import VisualizationDemo
 
 
@@ -53,16 +53,16 @@ def setup(args):
     cfg = get_cfg()
     # for poly lr schedule
     add_deeplab_config(cfg)
-    add_ssl_config(cfg)
+    add_wsl_config(cfg)
     add_maskformer2_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
-    # Update dataloader for SSL case.
-    if cfg.SSL.PERCENTAGE != 100:
-        cfg.DATASETS.TRAIN = (cfg.DATASETS.TRAIN[0]+f"_{cfg.SSL.PERCENTAGE}",)
+    # Update dataloader for WSL case.
+    if cfg.WSL.PERCENTAGE != 100:
+        cfg.DATASETS.TRAIN = (cfg.DATASETS.TRAIN[0]+f"_{cfg.WSL.PERCENTAGE}",)
     else:
         cfg.DATASETS.TRAIN = (cfg.DATASETS.TRAIN[0],)
-    if cfg.SSL.TRAIN_SSL:
+    if cfg.WSL.TRAIN_WSL:
         cfg.DATALOADER.SAMPLER_TRAIN = "RepeatFactorTrainingSampler"
         cfg.DATALOADER.REPEAT_THRESHOLD = 10.0
     

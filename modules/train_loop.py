@@ -100,6 +100,13 @@ from detectron2.engine.train_loop import HookBase
 #         return {}
 
 
+def _unwrap_ddp(model):
+    """create_ddp_model leaves single-process models unwrapped (no .module),
+    so accesses to custom attributes/methods need to go through this instead
+    of a bare `.module` to work in both single- and multi-GPU runs."""
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
 class TrainerBase:
     """
     Base class for iterative trainer with hooks.
@@ -560,9 +567,9 @@ class AMPTrainer(SimpleTrainer):
         self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
 
 
-class SimpleTrainerWSL(TrainerBase):
+class SimpleTrainerSSL(TrainerBase):
     """
-    A simple trainer for the most common type of weakly-supervised task:
+    A simple trainer for the most common type of task:
     single-cost single-optimizer single-data-source iterative optimization,
     optionally using data-parallelism.
     It assumes that every step, you:
@@ -589,6 +596,7 @@ class SimpleTrainerWSL(TrainerBase):
         gather_metric_period=1,
         zero_grad_before_forward=False,
         async_write_metrics=False,
+        data_loader_unl_pss=None,
     ):
         """
         Args:
@@ -601,6 +609,10 @@ class SimpleTrainerWSL(TrainerBase):
             zero_grad_before_forward: whether to zero the gradients before the forward.
             async_write_metrics: bool. If True, then write metrics asynchronously to improve
                 training speed
+            data_loader_unl_pss: optional second unlabeled-data iterable, carrying
+                PSS (part-semantic) weak labels instead of IIS instance labels.
+                When given, each WSL step alternates between data_loader_unl (IIS)
+                and this one (PSS).
         """
         super().__init__()
 
@@ -623,9 +635,11 @@ class SimpleTrainerWSL(TrainerBase):
 
         self.data_loader = data_loader
         self.data_loader_unl = data_loader_unl
+        self.data_loader_unl_pss = data_loader_unl_pss
         # to access the data loader iterator, call `self._data_loader_iter`
         self._data_loader_iter_obj = None
         self._data_loader_unl_iter_obj = None
+        self._data_loader_unl_pss_iter_obj = None
         self.optimizer = optimizer
         self.gather_metric_period = gather_metric_period
         self.zero_grad_before_forward = zero_grad_before_forward
@@ -638,7 +652,7 @@ class SimpleTrainerWSL(TrainerBase):
         # Update parameters.
         module_params = OrderedDict(module.named_parameters())
         ema_module_params = OrderedDict(ema_module.named_parameters())
-        
+
         assert module_params.keys() == ema_module_params.keys()
 
         for name, param in module_params.items():
@@ -659,16 +673,29 @@ class SimpleTrainerWSL(TrainerBase):
     def update_teacher_model(self, ema_decay):
         self.update_ema_module(self.model, self.model_teacher, ema_decay=ema_decay)
 
+    def _next_unlabeled_batch(self):
+        """Fetch the next WSL-step unlabeled batch, alternating between the
+        IIS and PSS unlabeled loaders (by iteration parity) when a second
+        (PSS) loader is configured; otherwise always draws from the IIS one.
+        Returns (data_unl, kind) where kind is 'iis' or 'pss'.
+        """
+        if self.data_loader_unl_pss is not None and self.iter % 2 == 1:
+            return next(self._data_loader_unl_pss_iter), 'pss'
+        return next(self._data_loader_unl_iter), 'iis'
+
     def run_step(self):
         """
-        Implement the standard training logic described above for weak supervision.
+        Implement the standard training logic described above.
         """
         assert self.model.training, "[SimpleTrainer] model was changed to eval mode!"
         start = time.perf_counter()
-        if self.model.module.do_wsl and self.model.module.iter % self.model.module.wsl_freq == 0 :
-            data_unl = next(self._data_loader_unl_iter)
-        else: 
-            data_unl = None
+        """
+        If you want to do something with the data, you can wrap the dataloader.
+        """
+        if _unwrap_ddp(self.model).do_ssl and _unwrap_ddp(self.model).iter % _unwrap_ddp(self.model).ssl_freq == 0 :
+            data_unl, unl_kind = self._next_unlabeled_batch()
+        else:
+            data_unl, unl_kind = None, 'iis'
         data = next(self._data_loader_iter)
         data_time = time.perf_counter() - start
 
@@ -680,19 +707,20 @@ class SimpleTrainerWSL(TrainerBase):
             self.optimizer.zero_grad()
 
         """
-        Update teacher model weights.
+        Update teacher weights using burn-in and EMA.
         """
-        if self.iter == self.model_teacher.module.burn_in:
+        burn_in = _unwrap_ddp(self.model_teacher).burn_in
+        if self.iter == burn_in:
             self.update_teacher_model(ema_decay=0.)
-        elif self.iter > self.model_teacher.module.burn_in:
-            self.update_teacher_model(ema_decay=self.model_teacher.module.ema_decay)
+        elif self.iter > burn_in:
+            self.update_teacher_model(ema_decay=_unwrap_ddp(self.model_teacher).ema_decay)
 
         """
         If you want to do something with the losses, you can wrap the model.
         """
         with torch.no_grad():
             teacher_preds = self.model_teacher(data_unl, return_preds=True)
-        teacher_pl = self.model_teacher.module.prepare_wsl_outputs(teacher_preds)
+        teacher_pl = _unwrap_ddp(self.model_teacher).prepare_ssl_outputs(teacher_preds)
         # self.model_teacher.module.instance_inference_teacher(teacher_preds)
 
         loss_dict = self.model(data, branch='supervised')
@@ -702,9 +730,9 @@ class SimpleTrainerWSL(TrainerBase):
         else:
             losses = sum(loss_dict.values())
         
-        data_wsl = {'data': data_unl, 'pseudo_label': teacher_pl}
-        
-        loss_dict_unl = self.model(data_wsl, branch = 'weak-supervised')
+        data_ssl = {'data': data_unl, 'pseudo_label': teacher_pl, 'kind': unl_kind}
+
+        loss_dict_unl = self.model(data_ssl, branch = 'semi-supervised')
         if isinstance(loss_dict_unl, torch.Tensor):
             losses_unl = loss_dict_unl
             loss_dict_unl['unsup_loss'] = loss_dict_unl
@@ -713,7 +741,7 @@ class SimpleTrainerWSL(TrainerBase):
         loss_dict.update(loss_dict_unl)
 
         losses_all = losses + losses_unl
-        
+
         if not self.zero_grad_before_forward:
             """
             If you need to accumulate gradients or do something similar, you can
@@ -752,6 +780,13 @@ class SimpleTrainerWSL(TrainerBase):
         if self._data_loader_unl_iter_obj is None:
             self._data_loader_unl_iter_obj = iter(self.data_loader_unl)
         return self._data_loader_unl_iter_obj
+
+    @property
+    def _data_loader_unl_pss_iter(self):
+        # only create the data loader iterator when it is used
+        if self._data_loader_unl_pss_iter_obj is None:
+            self._data_loader_unl_pss_iter_obj = iter(self.data_loader_unl_pss)
+        return self._data_loader_unl_pss_iter_obj
 
     def reset_data_loader(self, data_loader_builder):
         """
@@ -839,7 +874,7 @@ class SimpleTrainerWSL(TrainerBase):
         super().after_train()
         self.concurrent_executor.shutdown(wait=True)
 
-class AMPTrainerWSL(SimpleTrainerWSL):
+class AMPTrainerSSL(SimpleTrainerSSL):
     """
     Like :class:`SimpleTrainer`, but uses PyTorch's native automatic mixed precision
     in the training loop.
@@ -858,11 +893,12 @@ class AMPTrainerWSL(SimpleTrainerWSL):
         precision: torch.dtype = torch.float16,
         log_grad_scaler: bool = False,
         async_write_metrics=False,
+        data_loader_unl_pss=None,
     ):
         """
         Args:
             model, data_loader, optimizer, gather_metric_period, zero_grad_before_forward,
-                async_write_metrics: same as in :class:`SimpleTrainer`.
+                async_write_metrics, data_loader_unl_pss: same as in :class:`SimpleTrainerSSL`.
             grad_scaler: torch GradScaler to automatically scale gradients.
             precision: torch.dtype as the target precision to cast to in computations
         """
@@ -872,7 +908,8 @@ class AMPTrainerWSL(SimpleTrainerWSL):
         assert not isinstance(model, DataParallel), unsupported
 
         super().__init__(
-            model, model_teacher, data_loader, data_loader_unl, optimizer, gather_metric_period, zero_grad_before_forward
+            model, model_teacher, data_loader, data_loader_unl, optimizer, gather_metric_period,
+            zero_grad_before_forward, data_loader_unl_pss=data_loader_unl_pss,
         )
 
         if grad_scaler is None:
@@ -892,10 +929,10 @@ class AMPTrainerWSL(SimpleTrainerWSL):
         from torch.cuda.amp import autocast
 
         start = time.perf_counter()
-        if self.model.module.do_wsl and self.model.module.iter % self.model.module.wsl_freq == 0 :
-            data_unl = next(self._data_loader_unl_iter)
-        else: 
-            data_unl = None
+        if _unwrap_ddp(self.model).do_ssl and _unwrap_ddp(self.model).iter % _unwrap_ddp(self.model).ssl_freq == 0 :
+            data_unl, unl_kind = self._next_unlabeled_batch()
+        else:
+            data_unl, unl_kind = None, 'iis'
         data = next(self._data_loader_iter)
         data_time = time.perf_counter() - start
 
@@ -903,17 +940,18 @@ class AMPTrainerWSL(SimpleTrainerWSL):
             self.optimizer.zero_grad()
 
         """
-        Update teacher model weights.
+        Update teacher weights using burn-in and EMA.
         """
-        if self.iter == self.model_teacher.module.burn_in:
+        burn_in = _unwrap_ddp(self.model_teacher).burn_in
+        if self.iter == burn_in:
             self.update_teacher_model(ema_decay=0.)
-        elif self.iter > self.model_teacher.module.burn_in:
-            self.update_teacher_model(ema_decay=self.model_teacher.module.ema_decay)
+        elif self.iter > burn_in:
+            self.update_teacher_model(ema_decay=_unwrap_ddp(self.model_teacher).ema_decay)
 
         with torch.no_grad():
             teacher_preds = self.model_teacher(data_unl, return_preds=True)
-        teacher_pl = self.model_teacher.module.prepare_wsl_outputs(teacher_preds)
-        data_wsl = {'data': data_unl, 'pseudo_label': teacher_pl}
+        teacher_pl = _unwrap_ddp(self.model_teacher).prepare_ssl_outputs(teacher_preds)
+        data_ssl = {'data': data_unl, 'pseudo_label': teacher_pl, 'kind': unl_kind}
         del teacher_preds
     
         "Get pseudo-labels from teacher model."
@@ -925,9 +963,8 @@ class AMPTrainerWSL(SimpleTrainerWSL):
             else:
                 losses = sum(loss_dict.values())
 
-            
-        
-            loss_dict_unl = self.model(data_wsl, branch = 'weak-supervised')
+
+            loss_dict_unl = self.model(data_ssl, branch = 'semi-supervised')
             if isinstance(loss_dict_unl, torch.Tensor):
                 losses_unl = loss_dict_unl
                 loss_dict_unl['unsup_loss'] = loss_dict_unl
@@ -935,7 +972,7 @@ class AMPTrainerWSL(SimpleTrainerWSL):
                 losses_unl = sum(loss_dict_unl.values())
             loss_dict.update(loss_dict_unl)
             losses_all = losses + losses_unl
-        
+
         if not self.zero_grad_before_forward:
             self.optimizer.zero_grad()
 

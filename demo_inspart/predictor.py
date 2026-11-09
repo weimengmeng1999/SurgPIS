@@ -30,6 +30,7 @@ class VisualizationDemo(object):
         self.metadata = MetadataCatalog.get(
             cfg.DATASETS.TEST[0] if len(cfg.DATASETS.TEST) else "__unused"
         )
+        self.output_dir = cfg.OUTPUT_DIR
         self.cpu_device = torch.device("cpu")
         self.instance_mode = instance_mode
 
@@ -70,19 +71,19 @@ class VisualizationDemo(object):
 
                 pps_pred_np = predictions["parts"].detach().cpu().numpy()
                 pps_pred_img = Image.fromarray(pps_pred_np.astype(np.uint8))
-                save_dir_pps = os.path.join("/nfs/home/mwei/GuidedDistillation_output/output_inp_inf", "endo18", "inspart")   
+                save_dir_pps = os.path.join(self.output_dir, "inspart")   
                 os.makedirs(save_dir_pps, exist_ok=True)           
                 pps_pred_img.save(os.path.join(save_dir_pps,  image_id))
 
                 ins_map_np = predictions["ins_map"].detach().cpu().numpy()
                 ins_map_img = Image.fromarray(ins_map_np.astype(np.uint8))
-                save_dir_ins = os.path.join("/nfs/home/mwei/GuidedDistillation_output/output_inp_inf", "endo18", "ins")
+                save_dir_ins = os.path.join(self.output_dir, "ins")
                 os.makedirs(save_dir_ins, exist_ok=True) 
                 ins_map_img.save(os.path.join(save_dir_ins, image_id))
 
                 sem_map_np = predictions["sem_map"].detach().cpu().numpy()
                 sem_map_img = Image.fromarray(sem_map_np.astype(np.uint8))
-                save_dir_sem = os.path.join("/nfs/home/mwei/GuidedDistillation_output/output_inp_inf", "endo18", "sem")
+                save_dir_sem = os.path.join(self.output_dir, "sem")
                 os.makedirs(save_dir_sem , exist_ok=True) 
                 sem_map_img.save(os.path.join(save_dir_sem , image_id))
 

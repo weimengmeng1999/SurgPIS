@@ -51,7 +51,7 @@ class CfgNode(_CfgNode):
 
         # defaults.py needs to import CfgNode
         # from .defaults import _C
-        from config.defaults import _C
+        from surgpis_config.defaults import _C
 
 
         latest_ver = _C.VERSION

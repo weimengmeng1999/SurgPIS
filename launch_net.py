@@ -18,7 +18,7 @@ from detectron2.engine import default_argument_parser, launch
 def parse_args():
     d2_arg_parser = default_argument_parser()
     parser = argparse.ArgumentParser(
-        "Submitit launcher for D2-based Guided Distillation", parents=[d2_arg_parser], add_help=False
+        "Submitit launcher for SurgPIS", parents=[d2_arg_parser], add_help=False
     )
 
     parser.add_argument(

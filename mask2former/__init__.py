@@ -34,3 +34,4 @@ from .test_time_augmentation import SemanticSegmentorWithTTA
 
 # evaluation
 from .evaluation.instance_evaluation import InstanceSegEvaluator
+from .evaluation.part_pq_evaluator import PartPQEvaluator

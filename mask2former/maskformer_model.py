@@ -26,10 +26,30 @@ from detectron2.utils.memory import retry_if_cuda_oom
 
 import detectron2.utils.comm as comm
 
-from .modeling.criterion import SetCriterion, SetCriterionISS, SetCriterionIIS
+from .modeling.criterion import SetCriterion, SetCriterionWeakSup
 from .modeling.matcher import HungarianMatcher
 from .modeling.transformer_decoder.part_decoder import PartDecoder
 
+
+def add_tissue_target(target, valid_image_size):
+    """Add complement-of-instruments tissue, excluding artificial image padding.
+
+    Requires complete instrument annotations. Missing part labels inside an
+    annotated instrument do not turn that instrument into tissue.
+    """
+    target = dict(target)
+    masks = target["masks"]
+    height, width = valid_image_size
+    tissue = torch.zeros(masks.shape[-2:], dtype=torch.bool, device=masks.device)
+    tissue[:height, :width] = ~masks.bool().any(dim=0)[:height, :width]
+    target["labels"] = torch.cat([target["labels"].new_zeros(1), target["labels"] + 1])
+    target["masks"] = torch.cat([tissue[None].to(masks.dtype), masks])
+    if "masks_parts" in target:
+        target["masks_parts"] = [masks.new_zeros((0, *masks.shape[-2:]))] + target["masks_parts"]
+        target["num_masks_parts"] = torch.cat([
+            target["num_masks_parts"].new_zeros(1), target["num_masks_parts"]])
+        target["part_ids"] = [target["labels"].new_empty(0)] + target["part_ids"]
+    return target
 
 @META_ARCH_REGISTRY.register()
 class MaskFormer(nn.Module):
@@ -60,8 +80,8 @@ class MaskFormer(nn.Module):
         test_topk_per_image: int,
         save_dir: str,
         save_predictions: bool,
-        # wsl
-        wsl_criterion: nn.Module,
+        # ssl
+        ssl_criterion: nn.Module,
     ):
         """
         Args:
@@ -113,11 +133,16 @@ class MaskFormer(nn.Module):
 
         self.iter = 0
         self.cfg = cfg
-        self.wsl_freq =  self.cfg.WSL.FREQ
+        self.explicit_tissue_background = cfg.MODEL.MASK_FORMER.EXPLICIT_TISSUE_BACKGROUND
+        if self.explicit_tissue_background and sem_seg_head.num_classes != 10:
+            raise ValueError("Tissue formulation requires 10 semantic classes plus no-object")
+        self.ssl_freq =  self.cfg.WSL.FREQ
         self.burn_in =  self.cfg.WSL.BURNIN_ITER
-        self.do_wsl = self.cfg.WSL.TRAIN_WSL
+        self.do_ssl = self.cfg.WSL.TRAIN_WSL
         self.ema_decay = self.cfg.WSL.EMA_DECAY
-        self.wsl_criterion = wsl_criterion
+        self.ssl_weight_iis = self.cfg.WSL.WEIGHT_IIS
+        self.ssl_weight_pss = self.cfg.WSL.WEIGHT_PSS
+        self.ssl_criterion = ssl_criterion
         self.dropouts = nn.ModuleList([nn.Dropout(p=0.5) for _ in range(4)])
 
         if not self.semantic_on:
@@ -136,16 +161,34 @@ class MaskFormer(nn.Module):
         class_weight = cfg.MODEL.MASK_FORMER.CLASS_WEIGHT
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
+        dice_weight_parts = cfg.MODEL.MASK_FORMER.DICE_WEIGHT_PARTS
+        mask_weight_parts = cfg.MODEL.MASK_FORMER.MASK_WEIGHT_PARTS
+        matcher_use_parts = cfg.MODEL.MASK_FORMER.MATCHER_USE_PARTS
+        num_part_classes = cfg.MODEL.MASK_FORMER.NUM_PART_CLASSES
+
+        parts_decoder = PartDecoder(num_part_classes=num_part_classes,
+                    input_dim=cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
+                    hidden_dim=cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
+                    mask_dim=cfg.MODEL.SEM_SEG_HEAD.MASK_DIM,
+                    )
 
         # building criterion
+        # supervised (INP) matcher: includes the part-level mask cost in its
+        # cost matrix, so matching considers instrument and part masks together.
         matcher = HungarianMatcher(
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
+            cost_mask_parts=mask_weight_parts,
+            cost_dice_parts=dice_weight_parts,
+            parts_decoder=parts_decoder,
+            use_parts=matcher_use_parts,
         )
 
-        matcher_wsl = HungarianMatcher(
+        # semi-supervised (pseudo-label) matcher: instrument-level cost only,
+        # since pseudo part-masks are teacher predictions, not ground truth.
+        matcher_ssl = HungarianMatcher(
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
@@ -155,8 +198,14 @@ class MaskFormer(nn.Module):
         weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
         weight_dict.update({"loss_mask_parts": mask_weight})
         weight_dict.update({"loss_dice_parts": dice_weight})
-        weight_dict.update({"loss_mask_semantic": mask_weight})
-        weight_dict.update({"loss_dice_semantic": dice_weight})
+        weight_dict.update({"loss_mask_pss": mask_weight})
+        weight_dict.update({"loss_dice_pss": dice_weight})
+        # IIS branch's own direct-GT losses (see SetCriterionWeakSup.forward,
+        # "_iis" suffix) -- same weights as the base losses, just renamed to
+        # avoid colliding with the supervised branch's keys once merged.
+        weight_dict.update({"loss_ce_iis": class_weight})
+        weight_dict.update({"loss_mask_iis": mask_weight})
+        weight_dict.update({"loss_dice_iis": dice_weight})
         weight_dict.update({"loss_ce_pd": class_weight})
         weight_dict.update({"loss_mask_pd": mask_weight})
         weight_dict.update({"loss_dice_pd": dice_weight})
@@ -172,12 +221,6 @@ class MaskFormer(nn.Module):
 
         losses = ["labels", "masks"]
 
-        parts_decoder = PartDecoder(num_part_classes= 3,
-                    input_dim=cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
-                    hidden_dim=cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
-                    mask_dim=cfg.MODEL.SEM_SEG_HEAD.MASK_DIM,
-                    )
-
         criterion = SetCriterion(
             sem_seg_head.num_classes,
             matcher=matcher,
@@ -190,9 +233,10 @@ class MaskFormer(nn.Module):
             parts_decoder=parts_decoder,
         )
 
-        wsl_criterion = SetCriterionIIS(
+        # Handles both weak-supervision branches: IIS (forward) and PSS (forward_pss).
+        ssl_criterion = SetCriterionWeakSup(
             sem_seg_head.num_classes,
-            matcher=matcher,
+            matcher=matcher_ssl,
             weight_dict=weight_dict,
             eos_coef=no_object_weight,
             losses=losses,
@@ -200,18 +244,9 @@ class MaskFormer(nn.Module):
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
             parts_decoder=parts_decoder,
+            num_part_classes=num_part_classes,
+            explicit_tissue_background=cfg.MODEL.MASK_FORMER.EXPLICIT_TISSUE_BACKGROUND,
         )
-
-        # ssl_criterion = SetCriterionISS(
-        #     sem_seg_head.num_classes,
-        #     matcher=matcher_ssl,
-        #     weight_dict=weight_dict,
-        #     eos_coef=no_object_weight,
-        #     losses=losses,
-        #     num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
-        #     oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
-        #     importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
-        # )
 
         return {
             "cfg": cfg,
@@ -235,7 +270,7 @@ class MaskFormer(nn.Module):
             "instance_on": cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON,
             "panoptic_on": cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON,
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
-            "wsl_criterion": wsl_criterion,
+            "ssl_criterion": ssl_criterion,
             "save_dir": cfg.OUTPUT_DIR,
             "save_predictions": cfg.SAVE_PREDICTIONS,
         }
@@ -338,7 +373,7 @@ class MaskFormer(nn.Module):
         self.ema_sem_seg_head.load_state_dict(new_teacher_dict)
 
 
-    def prepare_wsl_outputs(self, targets, thresh_class = .7, thresh_mask=.95, mask_size = 5):
+    def prepare_ssl_outputs(self, targets, thresh_class = .7, thresh_mask=.7, mask_size = 5):
         new_outputs = []
         with torch.no_grad():
             bs = targets['pred_logits'].shape[0]
@@ -350,21 +385,39 @@ class MaskFormer(nn.Module):
                 queries = targets["decoder_output"][b]
 
                 objects = mask_cls.argmax(dim=1) != mask_cls.shape[1] - 1
+                # Preserve original decoder-query IDs through all filters.
+                query_ids = torch.arange(mask_cls.shape[0], device=mask_pred.device)[objects]
 
                 mask_cls = mask_cls[objects]
                 mask_pred = mask_pred[objects]
 
                 scores = F.softmax(mask_cls, dim=1).max(dim=1).values
-                query_ids = torch.arange(0, scores.shape[0], device=mask_pred.device)
 
                 high_conf = scores > thresh_class
                 mask_cls = mask_cls[high_conf]
                 mask_pred = mask_pred[high_conf]
                 cur_query_ids = query_ids[high_conf]
 
-                not_empty = torch.sigmoid(mask_pred).sum(dim=(1,2)) > mask_size
-                tar_cls = mask_cls[not_empty].argmax(dim=1)
-                tar_mask = torch.sigmoid(mask_pred[not_empty]) > .5
+                # Dice-based mask scoring filter: a confident mask's soft
+                # (sigmoid) probabilities already agree closely with its own
+                # >0.5 binarization; a blurry/uncertain one doesn't. Masks
+                # below thresh_mask are dropped so they contribute no gradient.
+                # Thin/elongated masks (e.g. instrument shafts) score lower on
+                # this metric than compact ones (e.g. tips) even at equal
+                # boundary sharpness, since more of their area sits near the
+                # blurry boundary relative to a confident core -- keep
+                # thresh_mask lenient enough that correct thin masks aren't
+                # systematically filtered out in favor of compact ones.
+                mask_prob = torch.sigmoid(mask_pred)
+                mask_hard = (mask_prob > 0.5).float()
+                dice_num = 2 * (mask_prob * mask_hard).sum(dim=(1, 2))
+                dice_den = mask_prob.sum(dim=(1, 2)) + mask_hard.sum(dim=(1, 2))
+                mask_dice_conf = dice_num / dice_den.clamp(min=1e-6)
+                confident = (mask_dice_conf > thresh_mask) & (mask_hard.sum(dim=(1, 2)) > mask_size)
+
+                tar_cls = mask_cls[confident].argmax(dim=1)
+                tar_mask = mask_prob[confident] > .5
+                cur_query_ids = cur_query_ids[confident]
 
                 gather_ids = []
                 num_parts_per_query = []
@@ -372,12 +425,13 @@ class MaskFormer(nn.Module):
 
                 for k in range(tar_cls.shape[0]):
                     pred_class = tar_cls[k].item()
-                    category_id = int(pred_class)
+                    category_id = int(pred_class) - int(getattr(self, "explicit_tissue_background", False))
+                    part_ids = self.metadata.train_sids2train_pids.get(category_id, [])
                     gather_ids.append(cur_query_ids[k])
-                    num_parts_per_query.append(len(self.metadata.train_sids2train_pids[category_id]))
+                    num_parts_per_query.append(len(part_ids))
                     part_ids_per_query.append(
                         torch.from_numpy(
-                            np.ascontiguousarray(self.metadata.train_sids2train_pids[category_id]) - 1).to(
+                            np.asarray(part_ids, dtype=np.int64) - 1).to(
                             mask_features.device))
                 
                 if len(gather_ids) > 0:
@@ -458,12 +512,12 @@ class MaskFormer(nn.Module):
                     segments_info (list[dict]): Describe each segment in `panoptic_seg`.
                         Each dict contains keys "id", "category_id", "isthing".
         """
-        do_wsl = self.do_wsl and self.iter % self.wsl_freq == 0 and self.training
-        assert branch in ['supervised', 'weak-supervised']
+        do_ssl = self.do_ssl and self.iter % self.ssl_freq == 0 and self.training
+        assert branch in ['supervised', 'semi-supervised']
         
         losses_all = {}
 
-        if branch == 'supervised': #not do_wsl or self.iter < self.burn_in:
+        if branch == 'supervised': #not do_ssl or self.iter < self.burn_in:
             if self.training:
                 # always use labeled data.
                 images = [x["image"].to(self.device) for x in batched_inputs]
@@ -480,6 +534,9 @@ class MaskFormer(nn.Module):
                 if "instances" in batched_inputs[0]:
                     gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
                     targets_instances = self.prepare_targets_inp(gt_instances, images)
+                    if self.explicit_tissue_background:
+                        targets_instances = [add_tissue_target(t, x["valid_image_size"])
+                                             for t, x in zip(targets_instances, batched_inputs)]
                 else:
                     targets_instances = None
                 # if "instances_sem_part" in batched_inputs[0]:
@@ -547,10 +604,16 @@ class MaskFormer(nn.Module):
                             r = retry_if_cuda_oom(sem_seg_postprocess)(r, image_size, height, width)
                         processed_results[-1]["sem_seg"] = r
 
-                    # panoptic segmentation inference
-                    if self.panoptic_on:
+                    # Panoptic/instance-part inference. panoptic_on and instance_on both
+                    # need panoptic_r/pps_inference's output, so compute it once and let
+                    # both flags consume the same result -- previously this ran twice
+                    # (once per flag) and saved the identical output twice under two
+                    # hardcoded, dataset-agnostic folder names ("endo17"/"endo18") that
+                    # didn't actually reflect which dataset was being evaluated.
+                    if self.panoptic_on or self.instance_on:
                         panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result)
-                        processed_results[-1]["panoptic_seg"] = panoptic_r[0:2]
+                        if self.panoptic_on:
+                            processed_results[-1]["panoptic_seg"] = panoptic_r[0:2]
 
                         partseg_pred, ins_map, sem_map = retry_if_cuda_oom(self.pps_inference)(panoptic_r,
                                                                         outputs["mask_features"],
@@ -567,77 +630,37 @@ class MaskFormer(nn.Module):
                         processed_results[-1]["sem_map"] = sem_map
 
                         if self.save_predictions:
-                            # Uncomment this if you wish to store the part segmentation predictions (also see train_net.py)
-                            # pred_np = partseg_pred.detach().cpu().numpy()
-                            # pred_img = Image.fromarray(pred_np.astype(np.uint8))
-                            # save_dir_parts = os.path.join(self.save_dir, "parts")
-                            # pred_img.save(os.path.join(save_dir_parts, str(batched_inputs[0]['image_id']) + ".png"))
+                            # datasets registered via load_sem_seg (e.g. sar_rarp50_pss_*)
+                            # don't carry an 'image_id' field -- fall back to the filename.
+                            image_id = batched_inputs[0].get('image_id') or \
+                                os.path.splitext(os.path.basename(batched_inputs[0]['file_name']))[0]
 
-                            # pps_pred_total = torch.stack(pps_pred, dim=-1)
-                            # image_id = os.path.splitext(os.path.basename(batched_inputs[0]['image_root']))[0]     
+                            # Named after whichever dataset Trainer.test() is currently
+                            # evaluating (set on the model right before inference_on_dataset
+                            # runs -- see modules/defaults.py's test()), not hardcoded, so
+                            # predictions from different datasets/runs don't collide or get
+                            # mislabeled under the wrong dataset's name.
+                            dataset_dir = getattr(self, "eval_dataset_name", "unknown_dataset")
+
                             pps_pred_np = partseg_pred.detach().cpu().numpy()
                             pps_pred_img = Image.fromarray(pps_pred_np.astype(np.uint8))
-                            # save_dir_pps = os.path.join(self.save_dir, "endo18", "inspart")   
-                            save_dir_pps = os.path.join(self.save_dir, "endo17", "inspart")   
-                            os.makedirs(save_dir_pps, exist_ok=True)           
-                            pps_pred_img.save(os.path.join(save_dir_pps,  batched_inputs[0]['image_id'] + ".png"))
-
-                            # pan_map_np = panoptic_r[0].detach().cpu().numpy()
-                            # pan_map_img = Image.fromarray(pan_map_np.astype(np.uint8))
-                            # save_dir_pan = os.path.join(self.save_dir, "endo17-seq4", "pan")
-                            # os.makedirs(save_dir_pan, exist_ok=True) 
-                            # pan_map_img.save(os.path.join(save_dir_pan, batched_inputs[0]['image_id'] + ".png"))
+                            save_dir_pps = os.path.join(self.save_dir, dataset_dir, "inspart")
+                            os.makedirs(save_dir_pps, exist_ok=True)
+                            pps_pred_img.save(os.path.join(save_dir_pps, image_id + ".png"))
 
                             ins_map_np = ins_map.detach().cpu().numpy()
                             ins_map_img = Image.fromarray(ins_map_np.astype(np.uint8))
-                            # save_dir_ins = os.path.join(self.save_dir, "endo18", "ins")
-                            save_dir_ins = os.path.join(self.save_dir, "endo17", "ins")
-                            os.makedirs(save_dir_ins, exist_ok=True) 
-                            ins_map_img.save(os.path.join(save_dir_ins, batched_inputs[0]['image_id'] + ".png"))
-                    
+                            save_dir_ins = os.path.join(self.save_dir, dataset_dir, "ins")
+                            os.makedirs(save_dir_ins, exist_ok=True)
+                            ins_map_img.save(os.path.join(save_dir_ins, image_id + ".png"))
+
                     # instance segmentation inference
                     if self.instance_on:
                         instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result)
                         processed_results[-1]["instances"] = instance_r
-
-                        panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result)
-                        partseg_pred, ins_map, sem_map= retry_if_cuda_oom(self.pps_inference)(panoptic_r,
-                                                                        outputs["mask_features"],
-                                                                        mask_cls_result,
-                                                                        outputs["decoder_output"],
-                                                                        b,
-                                                                        images.tensor.shape,
-                                                                        image_size,
-                                                                        height,
-                                                                        width)
-
-                        processed_results[-1]["parts"] = partseg_pred
-                        processed_results[-1]["ins_map"] = ins_map
-                        processed_results[-1]["sem_map"] = sem_map
-
-                        if self.save_predictions:
-                            # Uncomment this if you wish to store the part segmentation predictions (also see train_net.py)
-                            # pred_np = partseg_pred.detach().cpu().numpy()
-                            # pred_img = Image.fromarray(pred_np.astype(np.uint8))
-                            # save_dir_parts = os.path.join(self.save_dir, "parts")
-                            # pred_img.save(os.path.join(save_dir_parts, str(batched_inputs[0]['image_id']) + ".png"))
-
-                            # pps_pred_total = torch.stack(pps_pred, dim=-1)
-                            # image_id = os.path.splitext(os.path.basename(batched_inputs[0]['image_root']))[0]     
-                            pps_pred_np = partseg_pred.detach().cpu().numpy()
-                            pps_pred_img = Image.fromarray(pps_pred_np.astype(np.uint8))
-                            save_dir_pps = os.path.join(self.save_dir, "endo18", "inspart")   
-                            os.makedirs(save_dir_pps, exist_ok=True)           
-                            pps_pred_img.save(os.path.join(save_dir_pps,  batched_inputs[0]['image_id'] + ".png"))
-
-                            ins_map_np = ins_map.detach().cpu().numpy()
-                            ins_map_img = Image.fromarray(ins_map_np.astype(np.uint8))
-                            save_dir_ins = os.path.join(self.save_dir, "endo18", "ins")
-                            os.makedirs(save_dir_ins, exist_ok=True) 
-                            ins_map_img.save(os.path.join(save_dir_ins, batched_inputs[0]['image_id'] + ".png"))
                 return processed_results
             
-        elif branch == 'weak-supervised': # and self.iter >= self.burn_in:
+        elif branch == 'semi-supervised': # and self.iter >= self.burn_in:
             images_unl = [x["image_aug"].to(self.device) for x in batched_inputs['data']]
             images_unl = [(x - self.pixel_mean) / self.pixel_std for x in images_unl]
             images_unl = ImageList.from_tensors(images_unl, self.size_divisibility)
@@ -647,26 +670,37 @@ class MaskFormer(nn.Module):
             features = self.backbone(images_unl.tensor)
             outputs = self.sem_seg_head(features)
 
-            if "instances" in batched_inputs['data'][0]:
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs['data']]
-                targets_instances = self.prepare_targets(gt_instances, images_unl)
+            # 'kind' tags which weak dataset this batch came from (set by the
+            # trainer, which alternates between the IIS and PSS unlabeled
+            # dataloaders) so the right partial-ground-truth loss is used.
+            unl_kind = batched_inputs.get('kind', 'iis')
+            if unl_kind == 'pss':
+                targets_pss = [{"sem_seg": x["sem_seg"].to(self.device)} for x in batched_inputs['data']]
+                losses = self.ssl_criterion.forward_pss(outputs, batched_inputs['pseudo_label'], targets_pss)
             else:
-                targets_instances = None
-
-            losses = self.wsl_criterion(outputs, batched_inputs['pseudo_label'], targets_instances)
+                if "instances" in batched_inputs['data'][0]:
+                    gt_instances = [x["instances"].to(self.device) for x in batched_inputs['data']]
+                    targets_instances = self.prepare_targets(gt_instances, images_unl)
+                    if self.explicit_tissue_background:
+                        targets_instances = [add_tissue_target(t, x["valid_image_size"])
+                                             for t, x in zip(targets_instances, batched_inputs["data"])]
+                else:
+                    targets_instances = None
+                losses = self.ssl_criterion(outputs, batched_inputs['pseudo_label'], targets_instances)
 
             for k in list(losses.keys()):
-                if k in self.wsl_criterion.weight_dict:
-                    losses[k] *= self.wsl_criterion.weight_dict[k]
+                if k in self.ssl_criterion.weight_dict:
+                    losses[k] *= self.ssl_criterion.weight_dict[k]
                 else:
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
 
-            losses_wsl = {}
+            ssl_weight = self.ssl_weight_pss if unl_kind == 'pss' else self.ssl_weight_iis
+            losses_ssl = {}
             for k, v in losses.items():
-                losses_wsl[k + "_wsl"] = 2.0*v
-            
-            losses_all.update(losses_wsl)
+                losses_ssl[k + "_ssl"] = ssl_weight*v
+
+            losses_all.update(losses_ssl)
         
         return losses_all
         
@@ -755,6 +789,11 @@ class MaskFormer(nn.Module):
             stuff_memory_list = {}
             for k in range(cur_classes.shape[0]):
                 pred_class = cur_classes[k].item()
+                if self.explicit_tissue_background:
+                    # Tissue competes for pixels but is not an instrument detection.
+                    if pred_class == 0:
+                        continue
+                    pred_class -= 1  # export the original dataset's contiguous IDs
                 isthing = pred_class in self.metadata.thing_dataset_id_to_contiguous_id.values()
                 mask_area = (cur_mask_ids == k).sum().item()
                 original_area = (cur_masks[k] >= 0.5).sum().item()
@@ -799,12 +838,15 @@ class MaskFormer(nn.Module):
 
         # [Q, K]
         scores = F.softmax(mask_cls, dim=-1)[:, :-1]
-        labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
+        if self.explicit_tissue_background:
+            scores = scores[:, 1:]
+        num_instrument_classes = scores.shape[1]
+        labels = torch.arange(num_instrument_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
         # scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.num_queries, sorted=False)
         scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.test_topk_per_image, sorted=False)
         labels_per_image = labels[topk_indices]
 
-        topk_indices = topk_indices // self.sem_seg_head.num_classes
+        topk_indices = topk_indices // num_instrument_classes
         # mask_pred = mask_pred.unsqueeze(1).repeat(1, self.sem_seg_head.num_classes, 1).flatten(0, 1)
         mask_pred = mask_pred[topk_indices]
 

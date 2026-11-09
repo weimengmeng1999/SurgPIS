@@ -1,0 +1,10 @@
+_BASE_: maskformer2_R50_bs16_160k.yaml
+# Adds PartPQ (Part-aware Panoptic Quality) monitoring on top of the plain R50 stage-1
+# config. DATASETS.TEST is switched from endovis17_iis_val (no part-level ground truth)
+# to the "inp" datasets, which carry both instance + part_annotations ground truth.
+DATASETS:
+  TEST: ("endovis_inp_val", "endovis17_inp_val")
+MODEL:
+  MASK_FORMER:
+    TEST:
+      PARTPQ_ON: True

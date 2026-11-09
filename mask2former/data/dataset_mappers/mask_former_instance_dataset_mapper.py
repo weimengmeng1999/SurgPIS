@@ -212,6 +212,7 @@ class MaskFormerInstanceDatasetMapper:
         image_aug = torch.as_tensor(np.ascontiguousarray(image_aug).transpose(2, 0, 1))
 
         # Pad image and segmentation label here!
+        dataset_dict["valid_image_size"] = tuple(image.shape[:2])
         image = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
 
         masks = [torch.from_numpy(np.ascontiguousarray(x)) for x in masks]

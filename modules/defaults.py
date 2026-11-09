@@ -44,7 +44,8 @@ from detectron2.utils.logger import setup_logger
 
 # from . import hooks
 from detectron2.engine import hooks
-from .train_loop import AMPTrainer, SimpleTrainer, TrainerBase, SimpleTrainerWSL, AMPTrainerWSL
+from .train_loop import AMPTrainer, SimpleTrainer, TrainerBase, SimpleTrainerSSL, AMPTrainerSSL, _unwrap_ddp
+from .ensemble import EnsembleTSModel
 
 __all__ = [
     "create_ddp_model",
@@ -374,22 +375,29 @@ class DefaultTrainer(TrainerBase):
         # Assume these objects must be constructed in this order.
         model = self.build_model(cfg)
         optimizer = self.build_optimizer(cfg, model)
-        data_loader, data_loader_unl = self.build_train_loader(cfg)
+        built_loaders = self.build_train_loader(cfg)
+        if len(built_loaders) == 3:
+            data_loader, data_loader_unl, data_loader_unl_pss = built_loaders
+        elif len(built_loaders) == 2:
+            data_loader, data_loader_unl = built_loaders
+            data_loader_unl_pss = None
+        else:
+            (data_loader,) = built_loaders
+            data_loader_unl = None
+            data_loader_unl_pss = None
 
         if cfg.WSL.TRAIN_WSL:
             model_teacher = self.build_model(cfg)
             model_teacher = create_ddp_model(model_teacher, broadcast_buffers=False)
 
-        # model.init_ema_weights(cfg.SSL.TEACHER_CKPT)
+        # model.init_ema_weights(cfg.WSL.TEACHER_CKPT)
 
-        model = create_ddp_model(model, broadcast_buffers=False)
+        model = create_ddp_model(model, broadcast_buffers=False, find_unused_parameters=True)
         if cfg.WSL.TRAIN_WSL:
-            trainer_fn = AMPTrainerWSL if cfg.SOLVER.AMP.ENABLED else SimpleTrainerWSL
+            trainer_fn = AMPTrainerSSL if cfg.SOLVER.AMP.ENABLED else SimpleTrainerSSL
             self._trainer = trainer_fn(
-                model, model_teacher, data_loader, data_loader_unl, optimizer
-            )
-            DetectionCheckpointer(self._trainer.ensemble_model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
-                cfg.WSL.TEACHER_CKPT, resume=True
+                model, model_teacher, data_loader, data_loader_unl, optimizer,
+                data_loader_unl_pss=data_loader_unl_pss,
             )
         else:
             trainer_fn = AMPTrainer if cfg.SOLVER.AMP.ENABLED else SimpleTrainer
@@ -442,45 +450,26 @@ class DefaultTrainer(TrainerBase):
         else:
             return 'NEITHER'
 
-    def modified_checkpointer(self, resume):
-        if self.cfg.WSL.TRAIN_WSL:
-            which = self.parse_ckpt(self.cfg.MODEL.WEIGHTS)
-            print('Checkpoint weights correspond to : ', which)
-            if which == 'BOTH':
-                checkp = self._trainer.ensemble_model
-            elif which == 'STUDENT':
-                checkp = self._trainer.ensemble_model.modelStudent
-            elif which == 'TEACHER':
-                checkp = self._trainer.ensemble_model.modelTeacher
-            else:
-                checkp = self._trainer.ensemble_model.modelStudent
-        else:
-            checkp = self._trainer.ensemble_model #model
-        
-        DetectionCheckpointer(checkp, save_dir=self.cfg.OUTPUT_DIR).resume_or_load(
-            self.cfg.MODEL.WEIGHTS, resume=resume
-        )
-
     def resume_or_load(self, resume=True):
-        """
-        If `resume==True` and `cfg.OUTPUT_DIR` contains the last checkpoint (defined by
-        a `last_checkpoint` file), resume from the file. Resuming means loading all
-        available states (eg. optimizer and scheduler) and update iteration counter
-        from the checkpoint. ``cfg.MODEL.WEIGHTS`` will not be used.
-
-        Otherwise, this is considered as an independent training. The method will load model
-        weights from the file `cfg.MODEL.WEIGHTS` (but will not load other states) and start
-        from iteration 0.
-
-        Args:
-            resume (bool): whether to do resume or not
-        """
-        # self.checkpointer.resume_or_load(self.cfg.MODEL.WEIGHTS, resume=resume)
-        self.modified_checkpointer(resume)
+        """Resume full state, or initialize weights without importing source optimizer state."""
         if resume and self.checkpointer.has_checkpoint():
-            # The checkpoint stores the training iteration that just finished, thus we start
-            # at the next iteration
+            self.checkpointer.resume_or_load(self.cfg.MODEL.WEIGHTS, resume=True)
             self.start_iter = self.iter + 1
+            return
+        from modules.eval_checkpoint import EvaluationCheckpointer
+        unwrap = lambda model: getattr(model, 'module', model)
+        if self.cfg.WSL.TRAIN_WSL:
+            if not self.cfg.WSL.TEACHER_CKPT:
+                raise ValueError('Stage 2 requires WSL.TEACHER_CKPT from stage 1')
+            # EvaluationCheckpointer preserves version metadata and strictly selects
+            # the stage-1 trained model (stored in the modelTeacher slot).
+            for model in (self._trainer.model, self._trainer.model_teacher):
+                EvaluationCheckpointer(unwrap(model), eval_target='TEACHER').load(
+                    self.cfg.WSL.TEACHER_CKPT)
+        else:
+            EvaluationCheckpointer(unwrap(self._trainer.model), eval_target='TEACHER').load(
+                self.cfg.MODEL.WEIGHTS)
+        self.start_iter = 0
 
     def build_hooks(self):
         """
@@ -644,11 +633,11 @@ class DefaultTrainer(TrainerBase):
         It is not implemented by default.
         """
         raise NotImplementedError(
-            """
-If you want DefaultTrainer to automatically run evaluation,
-please implement `build_evaluator()` in subclasses (see train_net.py for example).
-Alternatively, you can call evaluation functions yourself (see Colab balloon tutorial for example).
-"""
+        """
+        If you want DefaultTrainer to automatically run evaluation,
+        please implement `build_evaluator()` in subclasses (see train_net.py for example).
+        Alternatively, you can call evaluation functions yourself (see Colab balloon tutorial for example).
+        """
         )
 
     @classmethod
@@ -677,6 +666,10 @@ Alternatively, you can call evaluation functions yourself (see Colab balloon tut
 
         results = OrderedDict()
         for idx, dataset_name in enumerate(cfg.DATASETS.TEST):
+            # Consumed by maskformer_model.py's forward() to name saved prediction
+            # folders after the actual dataset being evaluated, instead of a
+            # hardcoded, misleading name.
+            _unwrap_ddp(model).eval_dataset_name = dataset_name
             data_loader = cls.build_test_loader(cfg, dataset_name)
             # When evaluators are passed in as arguments,
             # implicitly assume that evaluators can be created before data_loader.

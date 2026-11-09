@@ -1,0 +1,10 @@
+_BASE_: stage1_R50.yaml
+WSL:
+  TRAIN_WSL: True
+  BURNIN_ITER: 0
+  IIS_DATASET_TRAIN: endovis17_iis_train
+  PSS_DATASET_TRAIN: sar_rarp50_pss_train
+  WEIGHT_IIS: 2.0
+  WEIGHT_PSS: 3.0
+  EMA_DECAY: 0.9996
+OUTPUT_DIR: output/stage2
