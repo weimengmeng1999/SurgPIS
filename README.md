@@ -2,6 +2,8 @@
 
 SurgPIS unifies surgical instrument segmentation as part-aware instance segmentation, predicting individual instruments together with their part semantics.
 
+[[Read the full paper]](https://ieeexplore.ieee.org/abstract/document/11735270/)
+
 ## News 📰
 
 - **[November 2026]** 🎉 **Model weights are now available**!
@@ -100,9 +102,20 @@ RESUME=1 bash stage2.sh
 
 ## Model evaluation
 
-### Evaluate or use the released Stage-1 R50 weights
+### Released model weights
 
-The public weights are available at [oliviamw/SurgPIS-Stage1-R50](https://huggingface.co/oliviamw/SurgPIS-Stage1-R50). They require the explicit-tissue configuration `configs/endovis/instance-part-segmentation/stage1_R50_pretrained.yaml`; the generic stage-1 config is not compatible with this checkpoint.
+| Stage | Backbone / model | Hugging Face | Download |
+|---|---|---|---|
+| 1 | RN50 | [SurgPIS-Stage1-RN50](https://huggingface.co/oliviamw/SurgPIS-Stage1-RN50) | [Weights](https://huggingface.co/oliviamw/SurgPIS-Stage1-RN50/resolve/main/surgpis_stage1_rn50.pth) |
+| 1 | DINO-B (DINOv2 ViT-B/14) | [SurgPIS-Stage1-DINOv2-Base](https://huggingface.co/oliviamw/SurgPIS-Stage1-DINOv2-Base) | [Weights](https://huggingface.co/oliviamw/SurgPIS-Stage1-DINOv2-Base/resolve/main/surgpis_stage1_dinov2_base.pth) |
+| 2 | RN50 Teacher | [SurgPIS-Stage2-RN50-Teacher](https://huggingface.co/oliviamw/SurgPIS-Stage2-RN50-Teacher) | [Weights](https://huggingface.co/oliviamw/SurgPIS-Stage2-RN50-Teacher/resolve/main/surgpis_stage2_rn50_teacher.pth) |
+| 2 | RN50 Student | [SurgPIS-Stage2-RN50-Student](https://huggingface.co/oliviamw/SurgPIS-Stage2-RN50-Student) | [Weights](https://huggingface.co/oliviamw/SurgPIS-Stage2-RN50-Student/resolve/main/surgpis_stage2_rn50_student.pth) |
+
+All releases contain standalone model weights only, without optimizer state. They use explicit tissue background (`NUM_CLASSES: 10`, plus the no-object output). RN50 releases use `stage1_R50_pretrained.yaml`; DINO-B additionally requires `DinoV2BaseBackbone`. The evaluation helper below is specific to the released Stage-1 RN50 checkpoint.
+
+### Evaluate or use the released Stage-1 RN50 weights
+
+The public weights are available at [oliviamw/SurgPIS-Stage1-RN50](https://huggingface.co/oliviamw/SurgPIS-Stage1-RN50). They require the explicit-tissue configuration `configs/endovis/instance-part-segmentation/stage1_R50_pretrained.yaml`; the generic stage-1 config is not compatible with this checkpoint.
 
 After installing the dependencies, run from this repository root:
 
@@ -117,7 +130,7 @@ This evaluates the released weights on the EndoVis 2017 and 2018 validation sets
 For a file already downloaded from Hugging Face:
 
 ```bash
-python tools/evaluate_pretrained_stage1.py --checkpoint /path/to/surgpis_stage1_r50.pth
+python tools/evaluate_pretrained_stage1.py --checkpoint /path/to/surgpis_stage1_rn50.pth
 ```
 
 Evaluation results are saved in `output/stage1_pretrained/verification.json`. You can also use these weights for inference or to initialize Stage 2. To train your own Stage-1 model, follow the [Stage 1 instructions](#stage-1-fully-supervised-pis).

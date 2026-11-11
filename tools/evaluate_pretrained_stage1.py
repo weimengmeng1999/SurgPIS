@@ -1,4 +1,4 @@
-"""Download the public Stage-1 R50 weights and evaluate the two validation splits."""
+"""Download the public Stage-1 RN50 weights and evaluate the two validation splits."""
 import argparse
 import hashlib
 import json
@@ -6,12 +6,12 @@ from pathlib import Path
 import subprocess
 import sys
 
-REPO = 'oliviamw/SurgPIS-Stage1-R50'
-REVISION = '395d786723803fb84e6cf9ed01076bf0ff076c66'
-FILENAME = 'surgpis_stage1_r50.pth'
-SHA256 = '76f6ff2170e5db1e84247cba80345e4e6f0630dae7f92531451b500951e84fe8'
-EXPECTED = {'endovis17_inp_val': (600, 55.21615170127188),
-            'endovis_inp_val': (596, 83.19291597925315)}
+REPO = 'oliviamw/SurgPIS-Stage1-RN50'
+REVISION = 'a6c649dc3d7c5d05c1573330012aec2f30e0adb5'
+FILENAME = 'surgpis_stage1_rn50.pth'
+SHA256 = '902f406ece382acfe7de5e005ae5a4ad2793a0571f2333ea853d77d653241b6f'
+EXPECTED = {'endovis17_inp_val': (600, 52.20751508992066),
+            'endovis_inp_val': (596, 81.83298309123475)}
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
@@ -27,7 +27,7 @@ def main():
         checkpoint=Path(hf_hub_download(REPO,FILENAME,revision=REVISION))
     digest=hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     if digest != SHA256:
-        raise ValueError('Checkpoint SHA256 does not match the published Stage-1 R50 weights')
+        raise ValueError('Checkpoint SHA256 does not match the published Stage-1 RN50 weights')
     subprocess.run([sys.executable,str(root/'tools/audit_partpq_tapps.py'),
         '--config-file',str(root/'configs/endovis/instance-part-segmentation/stage1_R50_pretrained.yaml'),
         '--reference',str(root/'tools/reference_tapps/evaluation_PartPQ.py'),
