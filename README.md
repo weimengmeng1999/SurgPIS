@@ -113,11 +113,9 @@ RESUME=1 bash stage2.sh
 
 All releases contain standalone model weights only, without optimizer state. They use explicit tissue background (`NUM_CLASSES: 10`, plus the no-object output). RN50 releases use `stage1_R50_pretrained.yaml`; DINO-B additionally requires `DinoV2BaseBackbone`. The evaluation helper below is specific to the released Stage-1 RN50 checkpoint.
 
-### Evaluate or use the released Stage-1 RN50 weights
+### Evaluate or continue training from Stage-1 weights
 
-The public weights are available at [oliviamw/SurgPIS-Stage1-RN50](https://huggingface.co/oliviamw/SurgPIS-Stage1-RN50). They require the explicit-tissue configuration `configs/endovis/instance-part-segmentation/stage1_R50_pretrained.yaml`; the generic stage-1 config is not compatible with this checkpoint.
-
-After installing the dependencies, run from this repository root:
+See [Released model weights](#released-model-weights) for available Stage-1 and Stage-2 checkpoints. To evaluate the released RN50 Stage-1 checkpoint on EndoVis validation data, set the dataset paths and run:
 
 ```bash
 export ENDOVIS17_ROOT=/path/to/EndoVis2017
@@ -125,15 +123,18 @@ export ENDOVIS18_ROOT=/path/to/EndoVis2018
 python tools/evaluate_pretrained_stage1.py
 ```
 
-This evaluates the released weights on the EndoVis 2017 and 2018 validation sets. Make sure CUDA is available and both datasets are prepared as described in [Dataset files and labels](docs/DATASETS.md).
+The helper evaluates the RN50 Stage-1 weights. To evaluate other checkpoints, use the evaluation commands below with the matching model configuration.
 
-For a file already downloaded from Hugging Face:
+To continue training with the released Stage-1 RN50 weights, use them to initialize Stage 2:
 
 ```bash
-python tools/evaluate_pretrained_stage1.py --checkpoint /path/to/surgpis_stage1_rn50.pth
+NUM_GPUS=2 \
+STAGE1_CHECKPOINT=/path/to/surgpis_stage1_rn50.pth \
+CONFIG=configs/endovis/instance-part-segmentation/stage2_R50_tissue.yaml \
+bash stage2.sh
 ```
 
-Evaluation results are saved in `output/stage1_pretrained/verification.json`. You can also use these weights for inference or to initialize Stage 2. To train your own Stage-1 model, follow the [Stage 1 instructions](#stage-1-fully-supervised-pis).
+To train Stage 1 from scratch, follow the [Stage 1 training instructions](#stage-1-fully-supervised-pis).
 
 Stage 1 stores its trained model under the `TEACHER` checkpoint slot; this is not an EMA teacher. Stage 2 stores both `TEACHER` and `STUDENT`.
 
