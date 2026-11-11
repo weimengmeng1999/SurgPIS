@@ -113,28 +113,30 @@ RESUME=1 bash stage2.sh
 
 All releases contain standalone model weights only, without optimizer state. They use explicit tissue background (`NUM_CLASSES: 10`, plus the no-object output). RN50 releases use `stage1_R50_pretrained.yaml`; DINO-B additionally requires `DinoV2BaseBackbone`. The evaluation helper below is specific to the released Stage-1 RN50 checkpoint.
 
-### Evaluate or continue training from Stage-1 weights
+### Continue training from Stage-1 weights
 
-See [Released model weights](#released-model-weights) for available Stage-1 and Stage-2 checkpoints. To evaluate the released RN50 Stage-1 checkpoint on EndoVis validation data, set the dataset paths and run:
-
-```bash
-export ENDOVIS17_ROOT=/path/to/EndoVis2017
-export ENDOVIS18_ROOT=/path/to/EndoVis2018
-python tools/evaluate_pretrained_stage1.py
-```
-
-The helper evaluates the RN50 Stage-1 weights. To evaluate other checkpoints, use the evaluation commands below with the matching model configuration.
-
-To continue training with the released Stage-1 RN50 weights, use them to initialize Stage 2:
+To continue Stage 1 from a released RN50 checkpoint, download it from [Released model weights](#released-model-weights) and use the matching explicit-tissue config:
 
 ```bash
-NUM_GPUS=2 \
-STAGE1_CHECKPOINT=/path/to/surgpis_stage1_rn50.pth \
-CONFIG=configs/endovis/instance-part-segmentation/stage2_R50_tissue.yaml \
-bash stage2.sh
+CONFIG=configs/endovis/instance-part-segmentation/stage1_R50_pretrained.yaml \
+OUTPUT_DIR=output/stage1_finetuned \
+bash stage1.sh MODEL.WEIGHTS /path/to/surgpis_stage1_rn50.pth
 ```
 
 To train Stage 1 from scratch, follow the [Stage 1 training instructions](#stage-1-fully-supervised-pis).
+
+### Evaluate Stage-2 weights
+
+Use the Stage-2 RN50 Teacher or Student checkpoint from [Released model weights](#released-model-weights). Set the EndoVis dataset paths first. For PartPQ evaluation on both validation sets, run:
+
+```bash
+python tools/audit_partpq_tapps.py \
+  --reference tools/reference_tapps/evaluation_PartPQ.py \
+  --checkpoint /path/to/surgpis_stage2_rn50_teacher.pth --model TEACHER --offsets 0 \
+  --datasets endovis_inp_val endovis17_inp_val --output-dir output/stage2_partpq
+```
+
+Use the Student checkpoint with `--model STUDENT` to evaluate that branch. EndoVis17 PartPQ requires its part annotations.
 
 Stage 1 stores its trained model under the `TEACHER` checkpoint slot; this is not an EMA teacher. Stage 2 stores both `TEACHER` and `STUDENT`.
 
