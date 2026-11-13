@@ -83,9 +83,8 @@ The codebase builds on Detectron2 and Mask2Former. Follow [install.md](install.m
 NUM_GPUS=2 bash stage1.sh
 ```
 
-### DINO-B and Swin-B
+### Alternative base models
 
-The same scripts support DINOv2 ViT-B/14 and Swin-B. Their defaults use explicit tissue background. Stage 1 uses only EndoVis18 **train** PIS; Stage 2 retains this PIS stream and adds EndoVis17 **train** IIS and SAR-RARP50 **train** PSS. Prepare the PSS masks as described in [dataset preparation](docs/DATASETS.md).
 
 DINO-B downloads its pretrained backbone through `torch.hub` before launching distributed training:
 
