@@ -153,7 +153,7 @@ def register_inp_dataset(root):
 
 
 # Register the dataset
-_root = '/nfs/home/mwei/EndoVis2018-refine'
+_root = os.environ.get("ENDOVIS18_ROOT", os.path.join(os.environ.get("DETECTRON2_DATASETS", "datasets"), "EndoVis2018"))
 register_inp_dataset(_root)
 
 

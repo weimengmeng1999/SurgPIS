@@ -1,0 +1,10 @@
+_BASE_: stage1_R50.yaml
+MODEL:
+  BACKBONE:
+    NAME: DinoV2BaseBackbone
+  WEIGHTS: ""
+  SEM_SEG_HEAD:
+    NUM_CLASSES: 10
+  MASK_FORMER:
+    EXPLICIT_TISSUE_BACKGROUND: True
+OUTPUT_DIR: output/stage1_dino_b

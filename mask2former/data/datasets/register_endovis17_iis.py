@@ -77,7 +77,7 @@ def register_all_robo_instance(root):
 
 
 # _root = os.getenv("DETECTRON2_DATASETS", "datasets")
-_root = '/nfs/home/mwei/EndoVis-RS17'
+_root = os.environ.get("ENDOVIS17_ROOT", os.path.join(os.environ.get("DETECTRON2_DATASETS", "datasets"), "EndoVis2017"))
 register_all_robo_instance(_root)
 # _root = '/nfs/home/mwei/Endovis2018-1exp/ins_seg'
 # register_all_robo_instance(_root)

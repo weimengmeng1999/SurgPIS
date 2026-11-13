@@ -83,6 +83,34 @@ The codebase builds on Detectron2 and Mask2Former. Follow [install.md](install.m
 NUM_GPUS=2 bash stage1.sh
 ```
 
+### DINO-B and Swin-B
+
+The same scripts support DINOv2 ViT-B/14 and Swin-B. Their defaults use explicit tissue background. Stage 1 uses only EndoVis18 **train** PIS; Stage 2 retains this PIS stream and adds EndoVis17 **train** IIS and SAR-RARP50 **train** PSS. Prepare the PSS masks as described in [dataset preparation](docs/DATASETS.md).
+
+DINO-B downloads its pretrained backbone through `torch.hub` before launching distributed training:
+
+```bash
+BACKBONE=dinob NUM_GPUS=2 bash stage1.sh
+BACKBONE=dinob NUM_GPUS=2 bash stage2.sh
+```
+
+For Swin-B, download and convert the pretrained ImageNet-22K backbone once:
+
+```bash
+mkdir -p weights
+curl -fL https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_base_patch4_window12_384_22k.pth \
+  -o weights/swin_base_patch4_window12_384_22k.pth
+python tools/convert-pretrained-swin-model-to-d2.py \
+  weights/swin_base_patch4_window12_384_22k.pth \
+  weights/swin_base_patch4_window12_384_22k.pkl
+BACKBONE=swinb NUM_GPUS=2 bash stage1.sh
+BACKBONE=swinb NUM_GPUS=2 bash stage2.sh
+```
+
+Outputs are `output/stage1_dino_b`, `output/stage2_dino_b`, `output/stage1_swin_b`, and `output/stage2_swin_b`. Stage 2 automatically selects the matching Stage-1 final checkpoint; use `STAGE1_CHECKPOINT=/path/to/checkpoint.pth` to select another checkpoint with the same architecture and label formulation. Use `RESUME=1` with the same backbone and output directory to resume.
+
+Both backbones inherit the standard 40,000-step schedule, batch size 16, IIS/PSS weights 2.0/3.0, and EMA decay 0.9996. Validation sets and EndoVis17 PIS are excluded from these training defaults.
+
 ### Stage 2: weak supervision from IIS and PSS
 
 ```bash
@@ -98,7 +126,7 @@ OUTPUT_DIR=output/stage1_custom bash stage1.sh SOLVER.IMS_PER_BATCH 4 SOLVER.MAX
 RESUME=1 bash stage2.sh
 ```
 
-`CONFIG`, `NUM_GPUS`, `PYTHON`, `OUTPUT_DIR`, and `RESUME` are environment overrides. Resuming restores model, optimizer, scheduler, iteration and AMP state from that output directory. GPU count does not automatically change the total batch size.
+`BACKBONE`, `CONFIG`, `NUM_GPUS`, `PYTHON`, `OUTPUT_DIR`, and `RESUME` are environment overrides. Resuming restores model, optimizer, scheduler, iteration and AMP state from that output directory. GPU count does not automatically change the total batch size.
 
 ## Model evaluation
 

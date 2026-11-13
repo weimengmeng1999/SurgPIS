@@ -1,0 +1,20 @@
+_BASE_: stage1_R50.yaml
+MODEL:
+  BACKBONE:
+    NAME: D2SwinTransformer
+  WEIGHTS: "weights/swin_base_patch4_window12_384_22k.pkl"
+  SEM_SEG_HEAD:
+    NUM_CLASSES: 10
+  MASK_FORMER:
+    EXPLICIT_TISSUE_BACKGROUND: True
+  SWIN:
+    EMBED_DIM: 128
+    DEPTHS: [2, 2, 18, 2]
+    NUM_HEADS: [4, 8, 16, 32]
+    WINDOW_SIZE: 12
+    PRETRAIN_IMG_SIZE: 384
+    APE: False
+    DROP_PATH_RATE: 0.3
+    PATCH_NORM: True
+    USE_CHECKPOINT: True
+OUTPUT_DIR: output/stage1_swin_b

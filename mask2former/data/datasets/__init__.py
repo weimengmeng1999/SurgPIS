@@ -16,4 +16,5 @@ from . import (
     register_endovis_inp,
     register_endovis_iss,
     register_endovis17_iis,
+    register_sar_rarp50_pss,
 )
