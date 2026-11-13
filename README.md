@@ -108,7 +108,6 @@ BACKBONE=swinb NUM_GPUS=2 bash stage2.sh
 
 Outputs are `output/stage1_dino_b`, `output/stage2_dino_b`, `output/stage1_swin_b`, and `output/stage2_swin_b`. Stage 2 automatically selects the matching Stage-1 final checkpoint; use `STAGE1_CHECKPOINT=/path/to/checkpoint.pth` to select another checkpoint with the same architecture and label formulation. Use `RESUME=1` with the same backbone and output directory to resume.
 
-Both backbones inherit the standard 40,000-step schedule, batch size 16, IIS/PSS weights 2.0/3.0, and EMA decay 0.9996. Validation sets and EndoVis17 PIS are excluded from these training defaults.
 
 ### Stage 2: weak supervision from IIS and PSS
 
